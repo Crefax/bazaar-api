@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, http::header};
 use futures_util::stream::TryStreamExt;
 use mongodb::{Client, options::ClientOptions, bson::{doc, Document}};
 use serde_json::json;
@@ -186,6 +186,13 @@ async fn get_fields(
 
 
 
+async fn not_found() -> impl Responder {
+    HttpResponse::NotFound()
+        .insert_header((header::CONTENT_TYPE, "application/json"))
+        .body(r#"{"error": "Page not found"}"#)
+}
+
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
@@ -193,6 +200,9 @@ async fn main() -> std::io::Result<()> {
             .service(get_latest_field)
             .service(get_latest_product)
             .service(get_fields)
+            .default_service(
+                web::route().to(not_found)
+            )
     })
     .bind(("127.0.0.1", 8080))?
     .run()
