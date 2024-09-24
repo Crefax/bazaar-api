@@ -6,6 +6,15 @@ use serde_json::json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+
+fn is_valid_product_id(product_id: &str) -> bool {
+    product_id.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn is_valid_field(field: &str) -> bool {
+    matches!(field, "sellPrice" | "buyPrice" | "sellVolume" | "buyVolume" | "sellOrders" | "buyOrders" | "sellMovingWeek" | "buyMovingWeek")
+}
+
 #[derive(Deserialize)]
 struct ApiKeyQuery {
     key: String,
@@ -29,6 +38,11 @@ async fn get_latest_product(
     product_id: web::Path<String>,
     query: web::Query<ApiKeyQuery>,
 ) -> impl Responder {
+
+    if !is_valid_product_id(&product_id) {
+        return HttpResponse::BadRequest().json(json!({"error": "invalid item"}));
+    }
+
     let client_uri = "mongodb://localhost:27017";
     let mut client_options = ClientOptions::parse(client_uri).await.unwrap();
     client_options.app_name = Some("hypixel".to_string());
@@ -83,6 +97,13 @@ async fn get_latest_field(
     let (product_id, field) = params.into_inner();
     let apikey: &String = &query.key;
 
+    if !is_valid_product_id(&product_id) {
+        return HttpResponse::BadRequest().json(json!({"error": "invalid item"}));
+    }
+    if !is_valid_field(&field) {
+        return HttpResponse::BadRequest().json(json!({"error": "invalid field"}));
+    }
+
     let client_uri = "mongodb://localhost:27017";
     let mut client_options = ClientOptions::parse(client_uri).await.unwrap();
     client_options.app_name = Some("hypixel".to_string());
@@ -133,6 +154,13 @@ async fn get_fields(
     let (product_id, field, limit) = params.into_inner();
     let apikey: &String = &query.key;
     
+    if !is_valid_product_id(&product_id) {
+        return HttpResponse::BadRequest().json(json!({"error": "invalid item"}));
+    }
+    if !is_valid_field(&field) {
+        return HttpResponse::BadRequest().json(json!({"error": "invalid field"}));
+    }
+
     let client_uri = "mongodb://localhost:27017";
     let mut client_options = ClientOptions::parse(client_uri).await.unwrap();
     client_options.app_name = Some("hypixel".to_string());
