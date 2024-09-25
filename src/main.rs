@@ -15,6 +15,15 @@ fn is_valid_field(field: &str) -> bool {
     matches!(field, "sellPrice" | "buyPrice" | "sellVolume" | "buyVolume" | "sellOrders" | "buyOrders" | "sellMovingWeek" | "buyMovingWeek")
 }
 
+async fn get_database(client: &Client, db_name: &str, col_name: &str) -> mongodb::Collection<Document> {
+    let database = client.database(db_name);
+    database.collection::<Document>(col_name)
+}
+
+struct AppState {
+    client: Client,
+}
+
 #[derive(Deserialize)]
 struct ApiKeyQuery {
     key: String,
@@ -33,29 +42,20 @@ struct QuickStatus {
     buyOrders: i32,
 }
 
-#[get("/api/{product_id}")]
+#[get("/api/skyblock/bazaar/{product_id}")]
 async fn get_latest_product(
     product_id: web::Path<String>,
     query: web::Query<ApiKeyQuery>,
+    data: web::Data<AppState>,
 ) -> impl Responder {
 
     if !is_valid_product_id(&product_id) {
         return HttpResponse::BadRequest().json(json!({"error": "invalid item"}));
     }
 
-    let client_uri = "mongodb://localhost:27017";
-    let mut client_options = ClientOptions::parse(client_uri).await.unwrap();
-    client_options.app_name = Some("hypixel".to_string());
-    let client = Client::with_options(client_options).unwrap();
     let apikey = &query.key;
-
-
-    let database = client.database("skyblock");
-    let collection = database.collection::<Document>("bazaar");
-
-    let apidatabase = client.database("users");
-    let apicollection: mongodb::Collection<Document> = apidatabase.collection("profile");
-
+    let collection = get_database(&data.client, "skyblock", "bazaar").await;
+    let apicollection = get_database(&data.client, "users", "profile").await;
 
     let filter = doc! { "product_id": product_id.into_inner() };
     let sort = doc! { "timestamp": -1 };
@@ -83,19 +83,16 @@ async fn get_latest_product(
     } else {
         return HttpResponse::NotFound().json(json!({"error": format!("Key Not Found")}))
     }
-    
-
-
 }
 
 
-#[get("/api/{product_id}/{field}")]
+#[get("/api/skyblock/bazaar/{product_id}/{field}")]
 async fn get_latest_field(
     params: web::Path<(String, String)>,
     query: web::Query<ApiKeyQuery>,
+    data: web::Data<AppState>,
 ) -> impl Responder {
     let (product_id, field) = params.into_inner();
-    let apikey: &String = &query.key;
 
     if !is_valid_product_id(&product_id) {
         return HttpResponse::BadRequest().json(json!({"error": "invalid item"}));
@@ -104,16 +101,9 @@ async fn get_latest_field(
         return HttpResponse::BadRequest().json(json!({"error": "invalid field"}));
     }
 
-    let client_uri = "mongodb://localhost:27017";
-    let mut client_options = ClientOptions::parse(client_uri).await.unwrap();
-    client_options.app_name = Some("hypixel".to_string());
-    let client = Client::with_options(client_options).unwrap();
-
-    let database = client.database("skyblock");
-    let collection = database.collection::<Document>("bazaar");
-
-    let apidatabase = client.database("users");
-    let apicollection: mongodb::Collection<Document> = apidatabase.collection("profile");
+    let apikey = &query.key;
+    let collection = get_database(&data.client, "skyblock", "bazaar").await;
+    let apicollection = get_database(&data.client, "users", "profile").await;
 
     let filter = doc! { "product_id": product_id };
     let sort = doc! { "timestamp": -1 };
@@ -146,14 +136,14 @@ async fn get_latest_field(
     HttpResponse::NotFound().json(json!({"error": format!("'{}' alanı için veri bulunamadı", field)}))
 }
 
-#[get("/api/{product_id}/{field}/{limit}")]
+#[get("/api/skyblock/bazaar/{product_id}/{field}/{limit}")]
 async fn get_fields(
     params: web::Path<(String, String, usize)>,
     query: web::Query<ApiKeyQuery>,
+    data: web::Data<AppState>,
 ) -> impl Responder {
     let (product_id, field, limit) = params.into_inner();
-    let apikey: &String = &query.key;
-    
+
     if !is_valid_product_id(&product_id) {
         return HttpResponse::BadRequest().json(json!({"error": "invalid item"}));
     }
@@ -161,16 +151,9 @@ async fn get_fields(
         return HttpResponse::BadRequest().json(json!({"error": "invalid field"}));
     }
 
-    let client_uri = "mongodb://localhost:27017";
-    let mut client_options = ClientOptions::parse(client_uri).await.unwrap();
-    client_options.app_name = Some("hypixel".to_string());
-    let client = Client::with_options(client_options).unwrap();
-
-    let database = client.database("skyblock");
-    let collection = database.collection::<Document>("bazaar");
-
-    let apidatabase = client.database("users");
-    let apicollection: mongodb::Collection<Document> = apidatabase.collection("profile");
+    let apikey = &query.key;
+    let collection = get_database(&data.client, "skyblock", "bazaar").await;
+    let apicollection = get_database(&data.client, "users", "profile").await;
 
     let filter = doc! { "product_id": product_id };
     let sort = doc! { "timestamp": -1 };
@@ -220,11 +203,17 @@ async fn not_found() -> impl Responder {
         .body(r#"{"error": "Page not found"}"#)
 }
 
-
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client_uri = "mongodb://localhost:27017";
+    let client_options = ClientOptions::parse(client_uri).await?;
+    let client = Client::with_options(client_options)?;
+
+    HttpServer::new(move || {
         App::new()
+            .app_data(web::Data::new(AppState {
+                client: client.clone(),
+            }))
             .service(get_latest_field)
             .service(get_latest_product)
             .service(get_fields)
@@ -234,5 +223,7 @@ async fn main() -> std::io::Result<()> {
     })
     .bind(("127.0.0.1", 8080))?
     .run()
-    .await
+    .await?;
+
+    Ok(())
 }
