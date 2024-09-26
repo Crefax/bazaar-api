@@ -6,6 +6,7 @@
 It allows you to view this data retrospectively via this API.
 
 [https://api.crefax.net](https://api.crefax.net)
+
 ![photo](https://i.ibb.co/LSJHNFZ/Ekran-g-r-nt-s-2024-09-26-224532.png)
 
 ## API Usage
