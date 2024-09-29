@@ -1,11 +1,10 @@
 #![allow(non_snake_case)]
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, http::header};
 use futures_util::stream::TryStreamExt;
-use mongodb::{Client, options::ClientOptions, bson::{doc, Document}};
+use mongodb::{Client, options::{ClientOptions, IndexOptions}, bson::{doc, Document}, IndexModel};
 use serde_json::json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
 
 fn is_valid_product_id(product_id: &str) -> bool {
     product_id.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -42,6 +41,20 @@ struct QuickStatus {
     buyOrders: i32,
 }
 
+async fn create_indexes(client: &Client) {
+    let db = client.database("skyblock");
+    let collection = db.collection::<Document>("bazaar");
+
+    let index_model = IndexModel::builder()
+        .keys(doc! { "product_id": 1, "timestamp": -1 })  
+        .options(IndexOptions::builder().unique(false).build()) 
+        .build();
+
+    if let Err(e) = collection.create_index(index_model, None).await {
+        eprintln!("Index Error: {}", e);
+    }
+}
+
 #[get("/api/skyblock/bazaar/{product_id}")]
 async fn get_latest_product(
     product_id: web::Path<String>,
@@ -67,21 +80,21 @@ async fn get_latest_product(
     if let Ok(Some(result)) = apicollection.find_one(apifilter, apioptions).await {
         if let Some(status) = result.get_bool("status").ok() {
             if status == false {
-                return HttpResponse::NotFound().json(json!({"error": "status false"}))
+                return HttpResponse::NotFound().json(json!({"error": "status false"}));
             }
             else if let Ok(Some(product)) = collection.find_one(filter, options).await {
                 let mut product_json: Value = serde_json::to_value(product).unwrap();
                 product_json.as_object_mut().unwrap().remove("_id");
 
-                HttpResponse::Ok().json(product_json)
+                return HttpResponse::Ok().json(product_json);
             } else {
-                HttpResponse::NotFound().json(json!({"error": "Item data not found"}))
+                return HttpResponse::NotFound().json(json!({"error": "Item data not found"}));
             }
         } else {
-            return HttpResponse::NotFound().json(json!({"error": format!("Key Not Found")}))
+            return HttpResponse::NotFound().json(json!({"error": "Key Not Found"}));
         }
     } else {
-        return HttpResponse::NotFound().json(json!({"error": format!("Key Not Found")}))
+        return HttpResponse::NotFound().json(json!({"error": "Key Not Found"}));
     }
 }
 
@@ -112,13 +125,11 @@ async fn get_latest_field(
     let apifilter = doc! { "apikey": apikey };
     let apioptions = mongodb::options::FindOneOptions::builder().build();
 
-
     if let Ok(Some(result)) = apicollection.find_one(apifilter, apioptions).await {
         if let Some(status) = result.get_bool("status").ok() {
             if status == false {
-                return HttpResponse::NotFound().json(json!({"error": "status false"}))
-            }
-            else if let Ok(Some(result)) = collection.find_one(filter, options).await {
+                return HttpResponse::NotFound().json(json!({"error": "status false"}));
+            } else if let Ok(Some(result)) = collection.find_one(filter, options).await {
                 if let Some(quick_status) = result.get("quick_status").and_then(|qs| qs.as_document()) {
                     if let Some(value) = quick_status.get(&field) {
                         return HttpResponse::Ok().json(value);
@@ -129,9 +140,8 @@ async fn get_latest_field(
             return HttpResponse::Ok().json("Key Kullanım Dışı!");
         }
     } else {
-        return HttpResponse::NotFound().json(json!({"error": format!("Key Not Found")}))
+        return HttpResponse::NotFound().json(json!({"error": "Key Not Found"}));
     }
-
 
     HttpResponse::NotFound().json(json!({"error": format!("'{}' alanı için veri bulunamadı", field)}))
 }
@@ -165,11 +175,10 @@ async fn get_fields(
 
     let mut results = Vec::new();
 
-
     if let Ok(Some(apiresult)) = apicollection.find_one(apifilter, apioptions).await {
         if let Some(status) = apiresult.get_bool("status").ok() {
             if status == false {
-                return HttpResponse::NotFound().json(json!({"error": "status false"}))
+                return HttpResponse::NotFound().json(json!({"error": "status false"}));
             } else {
                 while let Some(result) = cursor.try_next().await.unwrap() {
                     if let Some(quick_status) = result.get("quick_status").and_then(|qs| qs.as_document()) {
@@ -183,10 +192,8 @@ async fn get_fields(
             return HttpResponse::Ok().json("Key Kullanım Dışı!");
         }
     } else {
-        return HttpResponse::NotFound().json(json!({"error": format!("Key Not Found")}))
+        return HttpResponse::NotFound().json(json!({"error": format!("Key Not Found")}));
     }
-
-
 
     if results.is_empty() {
         HttpResponse::NotFound().json(json!({"error": format!("'{}' alanı için veri bulunamadı", field)}))
@@ -194,8 +201,6 @@ async fn get_fields(
         HttpResponse::Ok().json(json!(results))
     }
 }
-
-
 
 async fn not_found() -> impl Responder {
     HttpResponse::NotFound()
@@ -208,6 +213,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_uri = "mongodb://localhost:27017";
     let client_options = ClientOptions::parse(client_uri).await?;
     let client = Client::with_options(client_options)?;
+
+    create_indexes(&client).await;
 
     HttpServer::new(move || {
         App::new()
