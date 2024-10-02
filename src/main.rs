@@ -6,6 +6,8 @@ use serde_json::json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const MAX_CHECK_LIMIT: i64 = 500; // API sorgu limiti
+
 fn is_valid_product_id(product_id: &str) -> bool {
     product_id.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
@@ -55,6 +57,26 @@ async fn create_indexes(client: &Client) {
     }
 }
 
+// `checkLimit` ve `totalCheck` değerlerini artırır ve sorgu limitini kontrol eder
+async fn increment_api_usage(apicollection: &mongodb::Collection<Document>, apikey: &str) -> mongodb::error::Result<bool> {
+    let filter = doc! { "apikey": apikey };
+
+    if let Some(api_document) = apicollection.find_one(filter.clone(), None).await? {
+        if let Ok(check_limit) = api_document.get_i64("checkLimit") {
+            if check_limit >= MAX_CHECK_LIMIT {
+                return Ok(false);
+            }
+        }
+    }
+
+    let update = doc! {
+        "$inc": { "checkLimit": 1, "totalCheck": 1 }
+    };
+    apicollection.update_one(filter, update, None).await?;
+    Ok(true) // Limit aşılmadı, işlem başarılı
+}
+
+
 #[get("/api/skyblock/bazaar/{product_id}")]
 async fn get_latest_product(
     product_id: web::Path<String>,
@@ -82,13 +104,21 @@ async fn get_latest_product(
             if status == false {
                 return HttpResponse::NotFound().json(json!({"error": "status false"}));
             }
-            else if let Ok(Some(product)) = collection.find_one(filter, options).await {
-                let mut product_json: Value = serde_json::to_value(product).unwrap();
-                product_json.as_object_mut().unwrap().remove("_id");
+            
+            // Sorgu limiti kontrolü
+            match increment_api_usage(&apicollection, apikey).await {
+                Ok(true) => {
+                    if let Ok(Some(product)) = collection.find_one(filter, options).await {
+                        let mut product_json: Value = serde_json::to_value(product).unwrap();
+                        product_json.as_object_mut().unwrap().remove("_id");
 
-                return HttpResponse::Ok().json(product_json);
-            } else {
-                return HttpResponse::NotFound().json(json!({"error": "Item data not found"}));
+                        return HttpResponse::Ok().json(product_json);
+                    } else {
+                        return HttpResponse::NotFound().json(json!({"error": "Item data not found"}));
+                    }
+                },
+                Ok(false) => return HttpResponse::TooManyRequests().json(json!({"error": "Sorgu limiti aşıldı"})),
+                Err(e) => eprintln!("API kullanımı güncellenemedi: {}", e),
             }
         } else {
             return HttpResponse::NotFound().json(json!({"error": "Key Not Found"}));
@@ -96,8 +126,9 @@ async fn get_latest_product(
     } else {
         return HttpResponse::NotFound().json(json!({"error": "Key Not Found"}));
     }
-}
 
+    HttpResponse::InternalServerError().finish()
+}
 
 #[get("/api/skyblock/bazaar/{product_id}/{field}")]
 async fn get_latest_field(
@@ -129,12 +160,21 @@ async fn get_latest_field(
         if let Some(status) = result.get_bool("status").ok() {
             if status == false {
                 return HttpResponse::NotFound().json(json!({"error": "status false"}));
-            } else if let Ok(Some(result)) = collection.find_one(filter, options).await {
-                if let Some(quick_status) = result.get("quick_status").and_then(|qs| qs.as_document()) {
-                    if let Some(value) = quick_status.get(&field) {
-                        return HttpResponse::Ok().json(value);
+            }
+            
+            // Sorgu limiti kontrolü
+            match increment_api_usage(&apicollection, apikey).await {
+                Ok(true) => {
+                    if let Ok(Some(result)) = collection.find_one(filter, options).await {
+                        if let Some(quick_status) = result.get("quick_status").and_then(|qs| qs.as_document()) {
+                            if let Some(value) = quick_status.get(&field) {
+                                return HttpResponse::Ok().json(value);
+                            }
+                        }
                     }
-                }
+                },
+                Ok(false) => return HttpResponse::TooManyRequests().json(json!({"error": "Sorgu limiti aşıldı"})),
+                Err(e) => eprintln!("API kullanımı güncellenemedi: {}", e),
             }
         } else {
             return HttpResponse::Ok().json("Key Kullanım Dışı!");
@@ -180,12 +220,19 @@ async fn get_fields(
             if status == false {
                 return HttpResponse::NotFound().json(json!({"error": "status false"}));
             } else {
-                while let Some(result) = cursor.try_next().await.unwrap() {
-                    if let Some(quick_status) = result.get("quick_status").and_then(|qs| qs.as_document()) {
-                        if let Some(value) = quick_status.get(&field) {
-                            results.push(value.clone());
+                // Sorgu limiti kontrolü
+                match increment_api_usage(&apicollection, apikey).await {
+                    Ok(true) => {
+                        while let Some(result) = cursor.try_next().await.unwrap() {
+                            if let Some(quick_status) = result.get("quick_status").and_then(|qs| qs.as_document()) {
+                                if let Some(value) = quick_status.get(&field) {
+                                    results.push(value.clone());
+                                }
+                            }
                         }
-                    }
+                    },
+                    Ok(false) => return HttpResponse::TooManyRequests().json(json!({"error": "Sorgu limiti aşıldı"})),
+                    Err(e) => eprintln!("API kullanımı güncellenemedi: {}", e),
                 }
             }
         } else {
