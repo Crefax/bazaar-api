@@ -7,7 +7,7 @@ use crate::AppState;
 use crate::utils;
 use crate::{db, models::ApiKeyQuery};
 
-
+// Get Latest Product
 #[get("/api/skyblock/bazaar/{product_id}")]
 async fn get_latest_product(
     product_id: web::Path<String>,
@@ -33,6 +33,7 @@ async fn get_latest_product(
     }
 }
 
+// Get Latest Field
 #[get("/api/skyblock/bazaar/{product_id}/{field}")]
 async fn get_latest_field(
     params: web::Path<(String, String)>,
@@ -71,9 +72,10 @@ async fn get_latest_field(
         Err(e) => eprintln!("Failed to Update API: {}", e),
     }
 
-    HttpResponse::NotFound().json(json!({"error": format!("'{}' alanı için veri bulunamadı", field)}))
+    HttpResponse::NotFound().json(json!({"error": format!("'{}' Data Not Found", field)}))
 }
 
+// Get Fields with historical data
 #[get("/api/skyblock/bazaar/{product_id}/{field}/{limit}")]
 async fn get_fields(
     params: web::Path<(String, String, usize)>,
@@ -115,7 +117,7 @@ async fn get_fields(
         Err(e) => eprintln!("Failed to Update API: {}", e),
     }
 
-    HttpResponse::NotFound().json(json!({"error": format!("'{}' alanı için veri bulunamadı", field)}))
+    HttpResponse::NotFound().json(json!({"error": format!("'{}' Data Not Found", field)}))
 }
 
 pub async fn not_found() -> impl Responder {
