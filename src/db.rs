@@ -33,9 +33,20 @@ pub async fn check_api_key_and_increment_usage(
 
     if let Some(api_document) = apicollection.find_one(filter.clone(), None).await? {
         let checkLimit: i32 = api_document.get_i32("checkLimit").unwrap_or(0);
+        let totalCheck: i32 = api_document.get_i32("totalCheck").unwrap_or(0);
+        
         if checkLimit < MAX_CHECK_LIMIT {
             apicollection
-                .update_one(filter, doc! { "$set": { "checkLimit": checkLimit + 1 } }, None)
+                .update_one(
+                    filter,
+                    doc! {
+                        "$set": {
+                            "checkLimit": checkLimit + 1,
+                            "totalCheck": totalCheck + 1
+                        }
+                    },
+                    None
+                )
                 .await?;
             return Ok(true);
         }
