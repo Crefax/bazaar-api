@@ -1,53 +1,37 @@
 #![allow(non_snake_case)]
 use actix_web::{web, App, HttpServer};
 use mongodb::Client;
-use tokio::time::{interval, Duration};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod api;
+mod tracker;
 mod db;
 mod models;
-mod utils;
-
-struct AppState {
-    client: Client,
-}
 
 #[actix_web::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client_uri = "mongodb://localhost:27017"; // MongoDB URI
-    let interval_time = 600; // 10 minutes
+async fn main() -> std::io::Result<()> {
+    // Initialize MongoDB connection
+    let client = Client::with_uri_str("mongodb://localhost:27017")
+        .await
+        .expect("Failed to create MongoDB client");
+    let db = client.database("skyblock");
+    let db = Arc::new(Mutex::new(db));
 
-    let client_options = mongodb::options::ClientOptions::parse(client_uri).await?;
-    let client = Client::with_options(client_options)?;
-
-    db::create_indexes(&client).await;
-
-    // Reset Check Limits
-    let client_clone = client.clone();
+    // Start the tracker
+    let db_clone = db.clone();
     tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(interval_time));
-        loop {
-            interval.tick().await;
-            if let Err(e) = db::reset_check_limits(&client_clone).await {
-                eprintln!("Error resetting control limits: {}", e);
-            }
-        }
+        tracker::start_tracker(db_clone).await;
     });
 
-    // Start HTTP Server
+    // Start the API server
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(AppState {
-                client: client.clone(),
-            }))
-            .service(api::get_latest_product)
-            .service(api::get_latest_field)
-            .service(api::get_fields)
-            .default_service(web::route().to(api::not_found))
+            .app_data(web::Data::new(db.clone()))
+            .service(api::get_bazaar_data)
+            .service(api::get_bazaar_data_history)
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind("127.0.0.1:8080")?
     .run()
-    .await?;
-
-    Ok(())
+    .await
 }
