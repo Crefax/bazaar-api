@@ -22,7 +22,7 @@ cd bazaar-api
 cargo run
 ```
 
-The application will run on `127.0.0.1:8080` by default.
+The application will run on `127.0.0.1:22417` by default.
 
 ## API Reference
 

@@ -4,13 +4,13 @@ use mongodb::bson::doc;
 use futures::TryStreamExt;
 
 pub async fn insert_bazaar_data(db: &Database, data: BazaarData) -> Result<(), Box<dyn std::error::Error>> {
-    let collection = db.collection::<BazaarData>("bazaar_data");
+    let collection = db.collection::<BazaarData>("bazaar");
     collection.insert_one(data, None).await?;
     Ok(())
 }
 
 pub async fn get_latest_bazaar_data(db: &Database, product_id: &str) -> Result<Option<BazaarData>, Box<dyn std::error::Error>> {
-    let collection = db.collection::<BazaarData>("bazaar_data");
+    let collection = db.collection::<BazaarData>("bazaar");
     let filter = doc! { "product_id": product_id };
     let options = mongodb::options::FindOptions::builder()
         .sort(doc! { "timestamp": -1 })
@@ -31,7 +31,7 @@ pub async fn get_bazaar_data_by_timeframe(
     start_time: chrono::DateTime<chrono::Utc>,
     end_time: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<BazaarData>, Box<dyn std::error::Error>> {
-    let collection = db.collection::<BazaarData>("bazaar_data");
+    let collection = db.collection::<BazaarData>("bazaar");
     
     // Print timestamps for debugging
     println!("Start time: {}, End time: {}", start_time, end_time);

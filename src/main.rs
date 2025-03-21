@@ -31,7 +31,7 @@ async fn main() -> std::io::Result<()> {
             .service(api::get_bazaar_data)
             .service(api::get_bazaar_data_history)
     })
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:22417")?
     .run()
     .await
 }
