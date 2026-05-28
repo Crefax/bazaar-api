@@ -1,233 +1,147 @@
 # Bazaar API
 
-Bazaar API is a Rust/Actix service for tracking Hypixel SkyBlock Bazaar market data and serving chart-ready API responses. It stores the latest product state, materialized OHLCV candles, and public/admin API access controls.
+Bazaar API is a Rust/Actix service for tracking Hypixel SkyBlock Bazaar market data and serving chart-ready v2 API responses. It stores latest product snapshots, materialized OHLCV candles, user API keys, public access policy, and admin controls.
 
 ## Features
 
-- Chart-focused v2 REST API for products, latest prices, OHLCV candles, and line-series data.
+- v2-only REST API for products, latest prices, OHLCV candles, and line-series data.
 - Built-in admin panel at `/admin`.
-- Admin authentication with `ADMIN_API_KEY`, `X-Admin-Api-Key`, and HttpOnly admin sessions.
-- User API keys with hashed storage, per-key rate limits, rotate/revoke support, and `X-API-Key` authentication.
-- Anonymous public access with configurable rate limits.
+- Admin authentication with `ADMIN_API_KEY`, `X-Admin-Api-Key`, HttpOnly sessions, and CSRF protection for cookie-authenticated mutations.
+- User API keys with HMAC-hashed storage, one-time secret display, rotate/revoke support, per-key rate limits, and daily quotas.
+- Anonymous public access with configurable low rate limits.
+- Shared Redis-backed security store for production/multi-instance deployments, with bounded in-memory fallback for local development.
 - 15-second tracker cadence with duplicate snapshot skipping.
-- MongoDB-backed latest snapshots and materialized candles.
-- In-process cache and rate-limit fallback.
-- Health/readiness endpoints.
+- MongoDB latest snapshots and materialized candles for fast chart reads.
+- Minimal health/readiness endpoints.
 
 ## Requirements
 
 - Rust stable
-- MongoDB running locally or reachable over the network
+- MongoDB
+- Redis for production or any multi-instance deployment
 
 ## Configuration
 
-Copy the example env file and replace placeholder values:
+Copy the example env file and replace placeholder secrets:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-The application reads environment variables directly. In PowerShell, set them before running:
+Minimal local run:
 
 ```powershell
+$env:APP_ENV="development"
 $env:ADMIN_API_KEY="replace-with-a-long-random-admin-key"
+$env:API_KEY_HASH_PEPPER="replace-with-a-long-random-pepper"
 $env:MONGODB_URI="mongodb://localhost:27017"
 $env:MONGODB_DB="skyblock"
 $env:BIND_ADDR="127.0.0.1:22417"
 cargo run
 ```
 
-Available environment variables:
+Production/multi-instance run:
+
+```powershell
+$env:APP_ENV="production"
+$env:REQUIRE_REDIS="true"
+$env:REDIS_URL="redis://:strong-password@10.0.0.50:6379/0"
+$env:CORS_ALLOWED_ORIGINS="https://example.com"
+$env:TRUST_PROXY="true"
+$env:TRUSTED_PROXY_CIDRS="10.0.0.0/8"
+$env:ADMIN_COOKIE_SECURE="true"
+cargo run
+```
+
+Environment variables:
 
 | Variable | Default | Description |
 |---|---:|---|
+| `APP_ENV` | `development` | `development` or `production`. Production requires Redis-backed security behavior. |
 | `BIND_ADDR` | `127.0.0.1:22417` | HTTP bind address. |
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string. |
 | `MONGODB_DB` | `skyblock` | MongoDB database name. |
 | `ADMIN_API_KEY` | unset | Required for admin panel/API authentication. |
-| `CORS_ALLOWED_ORIGINS` | empty | Comma-separated allowed origins. Empty means allow any origin for local/dev use. |
-| `TRUST_PROXY` | `false` | Trust `X-Forwarded-For` for rate-limit IPs. Enable only behind a trusted proxy. |
-| `REDIS_URL` | unset | Reserved for optional Redis. Current runtime uses in-process fallback when Redis is not wired. |
+| `API_KEY_HASH_PEPPER` | dev value | HMAC pepper for user API key hashes. Use a strong secret. |
+| `REDIS_URL` | unset | Shared Redis URL for rate limits, quotas, sessions, access policy cache, and response cache. |
+| `REQUIRE_REDIS` | `false` | Forces fail-closed behavior when Redis is unavailable. Production also requires Redis. |
+| `CORS_ALLOWED_ORIGINS` | empty | Public API browser origins. Empty allows any origin only in development. |
+| `TRUST_PROXY` | `false` | Enables trusted proxy IP extraction. |
+| `TRUSTED_PROXY_CIDRS` | empty | Comma-separated CIDRs allowed to supply `X-Forwarded-For`. |
+| `ADMIN_COOKIE_SECURE` | env-based | Defaults to true in production and false in development. |
+| `CACHE_MAX_ENTRIES` | `10000` | Bounded local cache entries for development fallback. |
+| `RATE_LIMIT_MAX_KEYS` | `50000` | Bounded local rate/quota keys for development fallback. |
+| `ADMIN_JSON_LIMIT_BYTES` | `16384` | JSON payload limit. |
 
-## Running
-
-```powershell
-cargo run
-```
-
-Default URLs:
+## Runtime URLs
 
 - API base: `http://127.0.0.1:22417`
-- Admin panel: `http://127.0.0.1:22417/admin`
+- Admin panel: `GET /admin`
 - Health: `GET /health`
 - Readiness: `GET /ready`
 - OpenAPI summary: `GET /api/v2/openapi.json`
 
-## Admin Panel
-
-Open:
-
-```text
-http://127.0.0.1:22417/admin
-```
-
-Log in with the value of `ADMIN_API_KEY`.
-
-The panel can:
-
-- Toggle anonymous public API access.
-- Change anonymous and default user-key rate limits.
-- Create user API keys.
-- Rotate user API keys.
-- Revoke user API keys.
-- List key status, prefix, rate limit, and last-used time.
-
-User API keys are shown only once when created or rotated. Store them immediately. Only the key hash is stored in MongoDB.
+Only `/api/v2/...` is registered. Former `/api/v1/...` and `/api/...` routes are intentionally removed.
 
 ## Authentication
 
-Public v2 endpoints support two modes:
-
-- Anonymous access, controlled by the admin access policy.
-- User key access via:
+Public v2 endpoints support:
 
 ```http
 X-API-Key: bzusr_...
 ```
 
-Admin endpoints require one of:
+If anonymous access is enabled in the admin access policy, public endpoints can also be called without a key at a lower rate limit.
+
+Admin endpoints require either:
 
 ```http
 X-Admin-Api-Key: your-admin-key
 ```
 
-or an admin session cookie created by logging in through `/admin`.
+or an admin session cookie from `/admin`. Cookie-authenticated `POST`, `PATCH`, `PUT`, and `DELETE` admin calls also require `X-CSRF-Token`; the built-in panel handles this automatically.
 
-The admin key is not accepted as a public user API key.
+The admin key is rejected when sent as `X-API-Key`.
 
 ## Public API v2
 
-### List Products
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v2/skyblock/bazaar/products` | List product ids. |
+| `GET` | `/api/v2/skyblock/bazaar/products/latest?ids=...` | Get latest data for many products. |
+| `GET` | `/api/v2/skyblock/bazaar/products/{product_id}/latest` | Get latest data for one product. |
+| `GET` | `/api/v2/skyblock/bazaar/products/{product_id}/candles` | Get OHLCV candles. |
+| `GET` | `/api/v2/skyblock/bazaar/products/{product_id}/series` | Get line-series points. |
 
-```http
-GET /api/v2/skyblock/bazaar/products
-```
-
-Example response:
-
-```json
-{
-  "success": true,
-  "data": ["WHEAT", "ENCHANTED_WHEAT"],
-  "error": null,
-  "pagination": null,
-  "timestamp": "2026-05-28T13:34:06Z"
-}
-```
-
-### Batch Latest Prices
-
-```http
-GET /api/v2/skyblock/bazaar/products/latest?ids=WHEAT,ENCHANTED_WHEAT
-```
-
-If `ids` is omitted, the endpoint returns the latest snapshot list with an internal limit.
-
-### Single Latest Price
-
-```http
-GET /api/v2/skyblock/bazaar/products/WHEAT/latest
-```
-
-Example response:
-
-```json
-{
-  "success": true,
-  "data": {
-    "product_id": "WHEAT",
-    "buy_price": 6.4,
-    "sell_price": 5.8,
-    "buy_volume": 54321,
-    "sell_volume": 12345,
-    "buy_orders": 567,
-    "sell_orders": 890,
-    "timestamp": 1779975200000,
-    "updated_at": "2026-05-28T13:34:06Z"
-  },
-  "error": null,
-  "pagination": null,
-  "timestamp": "2026-05-28T13:34:06Z"
-}
-```
-
-### OHLCV Candles
-
-```http
-GET /api/v2/skyblock/bazaar/products/WHEAT/candles?interval=1m&range=1d&metric=mid_price
-```
-
-Supported `interval` values:
+Supported candle intervals:
 
 ```text
 15s, 1m, 5m, 15m, 1h, 1d, 1w, 1mo
 ```
 
-Supported `metric` values:
+Supported metrics:
 
 ```text
 buy_price, sell_price, mid_price, spread
 ```
 
-Optional query parameters:
-
-| Parameter | Description |
-|---|---|
-| `range` | Relative window such as `1h`, `1d`, `7d`, `30d`, `1y`. |
-| `start` | RFC3339/ISO 8601 start time. |
-| `end` | RFC3339/ISO 8601 end time. |
-| `limit` | Maximum points, clamped to `1..5000`. |
-
-Example response item:
-
-```json
-{
-  "t": "2026-05-28T13:34:00Z",
-  "period_end": "2026-05-28T13:35:00Z",
-  "open": 6.1,
-  "high": 6.5,
-  "low": 6.0,
-  "close": 6.3,
-  "volume": 152340,
-  "samples": 4
-}
-```
-
-### Line Series
-
-```http
-GET /api/v2/skyblock/bazaar/products/WHEAT/series?interval=1h&range=30d&metric=buy_price&stat=avg
-```
-
-Supported `stat` values:
+Supported series stats:
 
 ```text
 open, high, low, close, avg, volume
 ```
 
-Example response item:
+Granular range limits:
 
-```json
-{
-  "t": "2026-05-28T13:00:00Z",
-  "value": 6.22,
-  "samples": 240
-}
-```
+| Interval | Maximum query range |
+|---|---:|
+| `15s` | 24 hours |
+| `1m` | 30 days |
+| `5m`, `15m` | 180 days |
+| `1h` | 5 years |
+| `1d`, `1w`, `1mo` | 100 years |
 
 ## Admin API v2
-
-All admin endpoints require an admin session cookie or `X-Admin-Api-Key`.
 
 | Method | Path | Description |
 |---|---|---|
@@ -235,19 +149,22 @@ All admin endpoints require an admin session cookie or `X-Admin-Api-Key`.
 | `POST` | `/api/v2/admin/session/logout` | Log out and revoke the admin session. |
 | `GET` | `/api/v2/admin/api-keys` | List user API keys. |
 | `POST` | `/api/v2/admin/api-keys` | Create a user API key. |
-| `PATCH` | `/api/v2/admin/api-keys/{id}` | Update key metadata, status, scopes, or limits. |
+| `PATCH` | `/api/v2/admin/api-keys/{id}` | Update key metadata, status, rate limit, or daily quota. |
 | `POST` | `/api/v2/admin/api-keys/{id}/rotate` | Rotate a key and show the new secret once. |
 | `DELETE` | `/api/v2/admin/api-keys/{id}` | Revoke a key. |
 | `GET` | `/api/v2/admin/access-policy` | Read public API access policy. |
 | `PATCH` | `/api/v2/admin/access-policy` | Update anonymous access and default limits. |
+| `GET` | `/api/v2/admin/compression/stats` | Read compression statistics. |
+| `GET` | `/api/v2/admin/compression/logs` | Read compression logs. |
 
-Create a user key:
+Create a user key with a daily quota:
 
 ```powershell
 $body = @{
   name = "Example Client"
   owner_email = "client@example.com"
   rate_limit_per_minute = 600
+  daily_quota = 100000
 } | ConvertTo-Json
 
 Invoke-RestMethod `
@@ -266,6 +183,17 @@ Invoke-RestMethod `
   -Headers @{ "X-API-Key" = "bzusr_..." }
 ```
 
+## Security Behavior
+
+- Anonymous public rate limit default: `120 req/min/IP`.
+- User API key rate limit default: `600 req/min/key`.
+- Admin login limits: `5 req/min/IP` and `50 req/hour/IP`.
+- Admin API limit: `120 req/min/session-or-admin-key`.
+- Daily quotas reset at UTC midnight.
+- Production or multi-instance deployments must share the same Redis instance.
+- If Redis is required but unavailable, auth/rate-limit/quota/policy operations fail closed with `503`.
+- Public `500` responses do not include internal database errors.
+
 ## Data Storage
 
 MongoDB collections used by the v2 runtime:
@@ -275,15 +203,16 @@ MongoDB collections used by the v2 runtime:
 | `bazaar` | Raw changed snapshots. |
 | `bazaar_latest` | One latest snapshot per product. |
 | `bazaar_candles` | Materialized chart candles by product, interval, metric, and period. |
-| `api_keys` | Hashed user API keys and per-key limits. |
+| `api_keys` | Hashed user API keys and per-key limits/quotas. |
 | `api_settings` | Public access policy. |
-| `compression_log` | Existing compression/admin statistics support. |
+| `compression_log` | Compression/admin statistics support. |
 
 Retention behavior:
 
 | Resolution | Retention |
 |---|---|
 | Raw 15-second snapshots | 24 hours |
+| 15-second candles | 24 hours |
 | 1-minute candles | 30 days |
 | 5-minute and 15-minute candles | 180 days |
 | 1-hour candles | 5 years |
@@ -295,6 +224,7 @@ Retention behavior:
 cargo fmt
 cargo check
 cargo test
+cargo audit
 ```
 
 ## License

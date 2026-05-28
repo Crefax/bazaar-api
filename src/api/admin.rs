@@ -6,55 +6,94 @@ use actix_web::cookie::{Cookie, SameSite, time::Duration as CookieDuration};
 use actix_web::http::StatusCode;
 use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, patch, post, web};
 use chrono::{DateTime, Utc};
-use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
-use serde::Deserialize;
+use mongodb::bson::{Bson, DateTime as BsonDateTime, Document};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+const ADMIN_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const MAX_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
+const MAX_DAILY_QUOTA: u32 = 100_000_000;
+const ACCESS_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
+const USER_KEY_SCOPE: &str = "bazaar:read";
 
 #[get("/admin")]
 pub async fn admin_panel() -> impl Responder {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let html = ADMIN_PANEL_HTML.replace("{{NONCE}}", &nonce);
     HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(ADMIN_PANEL_HTML)
+        .insert_header(("Content-Type", "text/html; charset=utf-8"))
+        .insert_header(("Cache-Control", "no-store"))
+        .insert_header((
+            "Content-Security-Policy",
+            format!(
+                "default-src 'self'; script-src 'nonce-{}'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                nonce
+            ),
+        ))
+        .body(html)
 }
 
 #[post("/api/v2/admin/session")]
 pub async fn login(
+    req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<AdminLoginRequest>,
 ) -> impl Responder {
+    if let Err(response) = security::check_admin_login_rate_limit(&req, state.get_ref()).await {
+        return response;
+    }
     if let Err(response) = security::verify_admin_key(&body.admin_key, state.get_ref()) {
         return response;
     }
 
-    let token = state
-        .admin_sessions
-        .create(Duration::from_secs(12 * 60 * 60))
-        .await;
-    let cookie = Cookie::build(security::ADMIN_SESSION_COOKIE, token)
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Strict)
-        .max_age(CookieDuration::hours(12))
-        .finish();
+    let tokens = match state
+        .security_store
+        .create_admin_session(ADMIN_SESSION_TTL)
+        .await
+    {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            eprintln!("Admin session create failed: {}", error);
+            return security::problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "security_store_unavailable",
+                "Security store is unavailable",
+            );
+        }
+    };
+
+    let cookie = build_admin_cookie(
+        state.get_ref(),
+        tokens.session_token,
+        CookieDuration::hours(12),
+    );
 
     HttpResponse::Ok()
         .cookie(cookie)
-        .json(ApiResponse::success("ok"))
+        .json(ApiResponse::success(AdminLoginResponse {
+            status: "ok",
+            csrf_token: tokens.csrf_token,
+        }))
 }
 
 #[post("/api/v2/admin/session/logout")]
 pub async fn logout(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
-    if let Some(cookie) = req.cookie(security::ADMIN_SESSION_COOKIE) {
-        state.admin_sessions.revoke(cookie.value()).await;
+    if let Err(response) = security::authorize_admin(&req, state.get_ref()).await {
+        return response;
     }
 
-    let expired = Cookie::build(security::ADMIN_SESSION_COOKIE, "")
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Strict)
-        .max_age(CookieDuration::seconds(0))
-        .finish();
+    let cookie_name = security::admin_session_cookie_name(&state.config);
+    if let Some(cookie) = req.cookie(cookie_name) {
+        if let Err(error) = state
+            .security_store
+            .revoke_admin_session(cookie.value())
+            .await
+        {
+            eprintln!("Admin session revoke failed: {}", error);
+        }
+    }
 
+    let expired = build_admin_cookie(state.get_ref(), "", CookieDuration::seconds(0));
     HttpResponse::Ok()
         .cookie(expired)
         .json(ApiResponse::success("ok"))
@@ -72,11 +111,14 @@ pub async fn list_api_keys(req: HttpRequest, state: web::Data<AppState>) -> impl
                 .map(ApiKeySummary::from)
                 .collect::<Vec<_>>(),
         )),
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_keys_query_failed",
-            &format!("API keys could not be loaded: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("API keys query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_keys_query_failed",
+                "API keys could not be loaded",
+            )
+        }
     }
 }
 
@@ -90,38 +132,50 @@ pub async fn create_api_key(
         return response;
     }
 
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 120 {
+        return security::problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "name is required and must be at most 120 characters",
+        );
+    }
+    if let Err(response) = validate_user_scopes(body.scopes.as_deref()) {
+        return response;
+    }
+
     let policy = match db::get_access_policy(&state.db).await {
         Ok(policy) => policy,
-        Err(e) => {
+        Err(error) => {
+            eprintln!("Access policy load failed: {}", error);
             return security::problem(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "access_policy_error",
-                &format!("Access policy could not be loaded: {}", e),
+                "Access policy could not be loaded",
             );
         }
     };
 
-    let (plain_key, key_prefix, key_hash) = security::generate_user_api_key();
+    let (plain_key, key_prefix, key_hash) = security::generate_user_api_key(&state.config);
     let now = Utc::now();
     let record = ApiKeyRecord {
         id: None,
-        name: body.name.trim().to_string(),
+        name: name.to_string(),
         owner_email: body
             .owner_email
             .clone()
-            .filter(|value| !value.trim().is_empty()),
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value.len() <= 254),
         key_prefix,
         key_hash,
-        scopes: body
-            .scopes
-            .clone()
-            .filter(|scopes| !scopes.is_empty())
-            .unwrap_or_else(|| vec!["bazaar:read".to_string()]),
+        scopes: vec![USER_KEY_SCOPE.to_string()],
         rate_limit_per_minute: body
             .rate_limit_per_minute
             .unwrap_or(policy.default_user_rate_limit_per_minute)
-            .max(1),
-        daily_quota: body.daily_quota,
+            .clamp(1, MAX_RATE_LIMIT_PER_MINUTE),
+        daily_quota: body
+            .daily_quota
+            .map(|quota| quota.clamp(1, MAX_DAILY_QUOTA)),
         status: "active".to_string(),
         created_at: now,
         updated_at: now,
@@ -129,20 +183,19 @@ pub async fn create_api_key(
         expires_at: body.expires_at.as_deref().and_then(parse_optional_datetime),
     };
 
-    if record.name.is_empty() {
-        return security::problem(StatusCode::BAD_REQUEST, "invalid_name", "name is required");
-    }
-
     match db::insert_api_key(&state.db, record).await {
         Ok(record) => HttpResponse::Created().json(ApiResponse::success(CreatedApiKey {
             key: plain_key,
             record: ApiKeySummary::from(record),
         })),
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_key_create_failed",
-            &format!("API key could not be created: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("API key create failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_key_create_failed",
+                "API key could not be created",
+            )
+        }
     }
 }
 
@@ -159,30 +212,44 @@ pub async fn update_api_key(
 
     let mut update = Document::new();
     if let Some(name) = &body.name {
-        if name.trim().is_empty() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.len() > 120 {
             return security::problem(
                 StatusCode::BAD_REQUEST,
                 "invalid_name",
-                "name cannot be empty",
+                "name must be at most 120 characters",
             );
         }
-        update.insert("name", name.trim());
+        update.insert("name", trimmed);
     }
     if let Some(owner_email) = &body.owner_email {
-        if owner_email.trim().is_empty() {
-            update.insert("owner_email", mongodb::bson::Bson::Null);
+        let trimmed = owner_email.trim();
+        if trimmed.is_empty() {
+            update.insert("owner_email", Bson::Null);
+        } else if trimmed.len() <= 254 {
+            update.insert("owner_email", trimmed);
         } else {
-            update.insert("owner_email", owner_email.trim());
+            return security::problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_owner_email",
+                "owner_email must be at most 254 characters",
+            );
         }
     }
     if let Some(scopes) = &body.scopes {
-        update.insert("scopes", scopes);
+        if let Err(response) = validate_user_scopes(Some(scopes)) {
+            return response;
+        }
+        update.insert("scopes", vec![USER_KEY_SCOPE.to_string()]);
     }
     if let Some(limit) = body.rate_limit_per_minute {
-        update.insert("rate_limit_per_minute", limit.max(1));
+        update.insert(
+            "rate_limit_per_minute",
+            limit.clamp(1, MAX_RATE_LIMIT_PER_MINUTE),
+        );
     }
     if let Some(daily_quota) = body.daily_quota {
-        update.insert("daily_quota", daily_quota as i64);
+        update.insert("daily_quota", daily_quota.clamp(1, MAX_DAILY_QUOTA) as i64);
     }
     if let Some(status) = &body.status {
         if !["active", "disabled", "revoked"].contains(&status.as_str()) {
@@ -200,7 +267,7 @@ pub async fn update_api_key(
                 "expires_at",
                 BsonDateTime::from_millis(value.timestamp_millis()),
             ),
-            None => update.insert("expires_at", mongodb::bson::Bson::Null),
+            None => update.insert("expires_at", Bson::Null),
         };
     }
     update.insert(
@@ -217,11 +284,14 @@ pub async fn update_api_key(
             "api_key_not_found",
             "API key not found",
         ),
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_key_update_failed",
-            &format!("API key could not be updated: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("API key update failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_key_update_failed",
+                "API key could not be updated",
+            )
+        }
     }
 }
 
@@ -235,7 +305,7 @@ pub async fn rotate_api_key(
         return response;
     }
 
-    let (plain_key, key_prefix, key_hash) = security::generate_user_api_key();
+    let (plain_key, key_prefix, key_hash) = security::generate_user_api_key(&state.config);
     match db::rotate_api_key(&state.db, &id, key_prefix, key_hash).await {
         Ok(Some(record)) => HttpResponse::Ok().json(ApiResponse::success(CreatedApiKey {
             key: plain_key,
@@ -246,11 +316,14 @@ pub async fn rotate_api_key(
             "api_key_not_found",
             "API key not found",
         ),
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_key_rotate_failed",
-            &format!("API key could not be rotated: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("API key rotate failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_key_rotate_failed",
+                "API key could not be rotated",
+            )
+        }
     }
 }
 
@@ -273,11 +346,14 @@ pub async fn revoke_api_key(
             "api_key_not_found",
             "API key not found",
         ),
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_key_revoke_failed",
-            &format!("API key could not be revoked: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("API key revoke failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_key_revoke_failed",
+                "API key could not be revoked",
+            )
+        }
     }
 }
 
@@ -289,14 +365,28 @@ pub async fn get_access_policy(req: HttpRequest, state: web::Data<AppState>) -> 
 
     match db::get_access_policy(&state.db).await {
         Ok(policy) => {
-            state.access_policy_cache.set(policy.clone()).await;
+            if let Err(error) = state
+                .security_store
+                .set_access_policy(policy.clone(), ACCESS_POLICY_CACHE_TTL)
+                .await
+            {
+                eprintln!("Access policy cache set failed: {}", error);
+                return security::problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "security_store_unavailable",
+                    "Security store is unavailable",
+                );
+            }
             HttpResponse::Ok().json(ApiResponse::success(AccessPolicyView::from(policy)))
         }
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "access_policy_error",
-            &format!("Access policy could not be loaded: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("Access policy load failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "access_policy_error",
+                "Access policy could not be loaded",
+            )
+        }
     }
 }
 
@@ -313,26 +403,100 @@ pub async fn update_access_policy(
     match db::update_access_policy(
         &state.db,
         body.anonymous_public_enabled,
-        body.anonymous_rate_limit_per_minute,
-        body.default_user_rate_limit_per_minute,
+        body.anonymous_rate_limit_per_minute
+            .map(|limit| limit.clamp(1, MAX_RATE_LIMIT_PER_MINUTE)),
+        body.default_user_rate_limit_per_minute
+            .map(|limit| limit.clamp(1, MAX_RATE_LIMIT_PER_MINUTE)),
     )
     .await
     {
         Ok(policy) => {
-            state.access_policy_cache.set(policy.clone()).await;
+            if let Err(error) = state
+                .security_store
+                .set_access_policy(policy.clone(), ACCESS_POLICY_CACHE_TTL)
+                .await
+            {
+                eprintln!("Access policy cache update failed: {}", error);
+                return security::problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "security_store_unavailable",
+                    "Security store is unavailable",
+                );
+            }
             HttpResponse::Ok().json(ApiResponse::success(AccessPolicyView::from(policy)))
         }
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "access_policy_update_failed",
-            &format!("Access policy could not be updated: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("Access policy update failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "access_policy_update_failed",
+                "Access policy could not be updated",
+            )
+        }
+    }
+}
+
+#[get("/api/v2/admin/compression/stats")]
+pub async fn get_compression_stats_v2(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if let Err(response) = security::authorize_admin(&req, state.get_ref()).await {
+        return response;
+    }
+
+    match db::get_compression_stats(&state.db).await {
+        Ok(stats) => HttpResponse::Ok().json(ApiResponse::success(stats)),
+        Err(error) => {
+            eprintln!("Compression stats query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "compression_stats_failed",
+                "Compression stats could not be loaded",
+            )
+        }
+    }
+}
+
+#[get("/api/v2/admin/compression/logs")]
+pub async fn get_compression_logs_v2(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<CompressionLogsQuery>,
+) -> impl Responder {
+    if let Err(response) = security::authorize_admin(&req, state.get_ref()).await {
+        return response;
+    }
+
+    match db::get_compression_logs(
+        &state.db,
+        query.product_id.as_deref(),
+        query.compression_type.as_deref(),
+        query.limit.map(|limit| limit.clamp(1, 500)),
+    )
+    .await
+    {
+        Ok(logs) => HttpResponse::Ok().json(ApiResponse::success(logs)),
+        Err(error) => {
+            eprintln!("Compression logs query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "compression_logs_failed",
+                "Compression logs could not be loaded",
+            )
+        }
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AdminLoginRequest {
     pub admin_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminLoginResponse {
+    pub status: &'static str,
+    pub csrf_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,6 +527,13 @@ pub struct AccessPolicyPatch {
     pub default_user_rate_limit_per_minute: Option<u32>,
 }
 
+#[derive(Deserialize)]
+pub struct CompressionLogsQuery {
+    pub product_id: Option<String>,
+    pub compression_type: Option<String>,
+    pub limit: Option<i64>,
+}
+
 fn parse_optional_datetime(value: &str) -> Option<DateTime<Utc>> {
     if value.trim().is_empty() {
         return None;
@@ -370,6 +541,38 @@ fn parse_optional_datetime(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|value| value.with_timezone(&Utc))
+}
+
+fn validate_user_scopes(scopes: Option<&[String]>) -> Result<(), HttpResponse> {
+    if let Some(scopes) = scopes {
+        if scopes.is_empty() || scopes.iter().any(|scope| scope != USER_KEY_SCOPE) {
+            return Err(security::problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_scopes",
+                "User API keys may only use bazaar:read",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_admin_cookie(
+    state: &AppState,
+    value: impl Into<String>,
+    max_age: CookieDuration,
+) -> Cookie<'static> {
+    let mut builder = Cookie::build(
+        security::admin_session_cookie_name(&state.config),
+        value.into(),
+    )
+    .path("/")
+    .http_only(true)
+    .same_site(SameSite::Strict)
+    .max_age(max_age);
+    if state.config.admin_cookie_secure {
+        builder = builder.secure(true);
+    }
+    builder.finish()
 }
 
 const ADMIN_PANEL_HTML: &str = r#"<!doctype html>
@@ -403,61 +606,103 @@ const ADMIN_PANEL_HTML: &str = r#"<!doctype html>
     <h2>Login</h2>
     <label>Admin API Key</label>
     <input id="adminKey" type="password" autocomplete="current-password">
-    <button onclick="login()">Login</button>
+    <button id="loginButton">Login</button>
   </section>
   <section id="app" class="hidden">
-    <button class="secondary" onclick="loadAll()">Refresh</button>
-    <button class="secondary" onclick="logout()">Logout</button>
+    <button id="refreshButton" class="secondary">Refresh</button>
+    <button id="logoutButton" class="secondary">Logout</button>
     <h2>Access Policy</h2>
     <div class="grid">
       <label><input id="anonEnabled" type="checkbox" style="width:auto"> Anonymous public access</label>
       <label>Anonymous limit/min <input id="anonLimit" type="number" min="1"></label>
       <label>Default user key limit/min <input id="userLimit" type="number" min="1"></label>
     </div>
-    <button onclick="savePolicy()">Save Policy</button>
+    <button id="savePolicyButton">Save Policy</button>
     <h2>Create User API Key</h2>
     <div class="grid">
       <label>Name <input id="keyName"></label>
       <label>Owner email <input id="ownerEmail"></label>
       <label>Rate limit/min <input id="keyLimit" type="number" min="1" placeholder="600"></label>
+      <label>Daily quota <input id="dailyQuota" type="number" min="1"></label>
     </div>
-    <button onclick="createKey()">Create Key</button>
+    <button id="createKeyButton">Create Key</button>
     <pre id="createdKey"></pre>
     <h2>User API Keys</h2>
     <table>
-      <thead><tr><th>Name</th><th>Prefix</th><th>Status</th><th>Limit/min</th><th>Last used</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Prefix</th><th>Status</th><th>Limit/min</th><th>Daily quota</th><th>Last used</th><th>Actions</th></tr></thead>
       <tbody id="keys"></tbody>
     </table>
   </section>
 </main>
-<script>
+<script nonce="{{NONCE}}">
+let csrfToken = null;
+
 async function api(path, options = {}) {
-  const res = await fetch(path, { headers: { 'content-type': 'application/json', ...(options.headers || {}) }, ...options });
+  const method = (options.method || 'GET').toUpperCase();
+  const headers = { 'content-type': 'application/json', ...(options.headers || {}) };
+  if (csrfToken && ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method)) {
+    headers['X-CSRF-Token'] = csrfToken;
+  }
+  const res = await fetch(path, { headers, credentials: 'same-origin', ...options });
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json?.error?.message || res.statusText);
   return json;
 }
+
 async function login() {
-  await api('/api/v2/admin/session', { method: 'POST', body: JSON.stringify({ admin_key: document.getElementById('adminKey').value }) });
+  const result = await api('/api/v2/admin/session', { method: 'POST', body: JSON.stringify({ admin_key: document.getElementById('adminKey').value }) });
+  csrfToken = result.data.csrf_token;
   document.getElementById('login').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
   await loadAll();
 }
+
 async function logout() {
   await api('/api/v2/admin/session/logout', { method: 'POST' });
   location.reload();
 }
+
 async function loadAll() {
   const policy = (await api('/api/v2/admin/access-policy')).data;
   document.getElementById('anonEnabled').checked = policy.anonymous_public_enabled;
   document.getElementById('anonLimit').value = policy.anonymous_rate_limit_per_minute;
   document.getElementById('userLimit').value = policy.default_user_rate_limit_per_minute;
   const keys = (await api('/api/v2/admin/api-keys')).data;
-  document.getElementById('keys').innerHTML = keys.map(k => `<tr>
-    <td>${escapeHtml(k.name)}</td><td>${k.key_prefix}</td><td>${k.status}</td><td>${k.rate_limit_per_minute}</td><td>${k.last_used_at || ''}</td>
-    <td><button class="secondary" onclick="rotateKey('${k.id}')">Rotate</button><button class="danger" onclick="revokeKey('${k.id}')">Revoke</button></td>
-  </tr>`).join('');
+  renderKeys(keys);
 }
+
+function renderKeys(keys) {
+  const tbody = document.getElementById('keys');
+  tbody.replaceChildren();
+  for (const key of keys) {
+    const tr = document.createElement('tr');
+    appendCell(tr, key.name);
+    appendCell(tr, key.key_prefix);
+    appendCell(tr, key.status);
+    appendCell(tr, key.rate_limit_per_minute);
+    appendCell(tr, key.daily_quota || '');
+    appendCell(tr, key.last_used_at || '');
+    const actionCell = document.createElement('td');
+    const rotate = document.createElement('button');
+    rotate.className = 'secondary';
+    rotate.textContent = 'Rotate';
+    rotate.addEventListener('click', () => rotateKey(key.id));
+    const revoke = document.createElement('button');
+    revoke.className = 'danger';
+    revoke.textContent = 'Revoke';
+    revoke.addEventListener('click', () => revokeKey(key.id));
+    actionCell.append(rotate, revoke);
+    tr.appendChild(actionCell);
+    tbody.appendChild(tr);
+  }
+}
+
+function appendCell(row, value) {
+  const td = document.createElement('td');
+  td.textContent = value;
+  row.appendChild(td);
+}
+
 async function savePolicy() {
   await api('/api/v2/admin/access-policy', { method: 'PATCH', body: JSON.stringify({
     anonymous_public_enabled: document.getElementById('anonEnabled').checked,
@@ -466,29 +711,37 @@ async function savePolicy() {
   })});
   await loadAll();
 }
+
 async function createKey() {
   const limit = Number(document.getElementById('keyLimit').value);
+  const quota = Number(document.getElementById('dailyQuota').value);
   const payload = {
     name: document.getElementById('keyName').value,
     owner_email: document.getElementById('ownerEmail').value || null,
-    rate_limit_per_minute: limit || null
+    rate_limit_per_minute: limit || null,
+    daily_quota: quota || null
   };
   const created = (await api('/api/v2/admin/api-keys', { method: 'POST', body: JSON.stringify(payload) })).data;
   document.getElementById('createdKey').textContent = `Save this key now. It will not be shown again:\n${created.key}`;
   await loadAll();
 }
+
 async function rotateKey(id) {
   const rotated = (await api(`/api/v2/admin/api-keys/${id}/rotate`, { method: 'POST' })).data;
   document.getElementById('createdKey').textContent = `Rotated key. Save this key now:\n${rotated.key}`;
   await loadAll();
 }
+
 async function revokeKey(id) {
   await api(`/api/v2/admin/api-keys/${id}`, { method: 'DELETE' });
   await loadAll();
 }
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
-}
+
+document.getElementById('loginButton').addEventListener('click', login);
+document.getElementById('logoutButton').addEventListener('click', logout);
+document.getElementById('refreshButton').addEventListener('click', loadAll);
+document.getElementById('savePolicyButton').addEventListener('click', savePolicy);
+document.getElementById('createKeyButton').addEventListener('click', createKey);
 </script>
 </body>
 </html>"#;

@@ -78,10 +78,13 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
     }
 
     if changed_count > 0 {
-        state.cache.remove_prefix("v2:latest").await;
-        state.cache.remove_prefix("v2:candles").await;
-        state.cache.remove_prefix("v2:series").await;
-        state.cache.remove_prefix("v2:products").await;
+        state.security_store.cache_remove_prefix("v2:latest").await;
+        state.security_store.cache_remove_prefix("v2:candles").await;
+        state.security_store.cache_remove_prefix("v2:series").await;
+        state
+            .security_store
+            .cache_remove_prefix("v2:products")
+            .await;
         println!("Tracker stored {} changed products", changed_count);
     }
 
@@ -112,13 +115,21 @@ mod tests {
             mongodb_uri: "mongodb://localhost:27017".to_string(),
             mongodb_db: "test".to_string(),
             bind_addr: "127.0.0.1:0".to_string(),
+            app_env: crate::config::AppEnvironment::Development,
             admin_api_key: Some("admin".to_string()),
             cors_allowed_origins: vec![],
             trust_proxy: false,
+            trusted_proxy_cidrs: vec![],
             redis_url: None,
+            require_redis: false,
+            api_key_hash_pepper: "test-pepper".to_string(),
+            admin_cookie_secure: false,
+            cache_max_entries: 10,
+            rate_limit_max_keys: 10,
+            admin_json_limit_bytes: 16 * 1024,
         });
         let client = Client::with_uri_str(&config.mongodb_uri).await.unwrap();
-        let state = AppState::new(client.database(&config.mongodb_db), config);
+        let state = AppState::new(client.database(&config.mongodb_db), config).await;
         let snapshot = ProductSnapshot {
             buy_price: 1.0,
             sell_price: 2.0,

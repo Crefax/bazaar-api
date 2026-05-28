@@ -1,34 +1,24 @@
 # Bazaar API v2 Usage Examples
 
-These examples intentionally use only the v2 API surface.
+These examples intentionally use only the v2 API surface. Former `/api/v1/...` and `/api/...` routes are not registered.
 
 ## Public Requests
-
-### List Products
 
 ```http
 GET /api/v2/skyblock/bazaar/products
 ```
 
-### Get Latest Data for One Product
-
 ```http
 GET /api/v2/skyblock/bazaar/products/WHEAT/latest
 ```
-
-### Get Latest Data for Multiple Products
 
 ```http
 GET /api/v2/skyblock/bazaar/products/latest?ids=WHEAT,ENCHANTED_WHEAT
 ```
 
-### Get OHLCV Candles
-
 ```http
 GET /api/v2/skyblock/bazaar/products/WHEAT/candles?interval=1m&range=1d&metric=mid_price
 ```
-
-### Get a Line Series
 
 ```http
 GET /api/v2/skyblock/bazaar/products/WHEAT/series?interval=1h&range=30d&metric=buy_price&stat=avg
@@ -42,7 +32,22 @@ Invoke-RestMethod `
   -Headers @{ "X-API-Key" = "bzusr_..." }
 ```
 
-## Admin Requests
+Rate-limit headers:
+
+```http
+X-RateLimit-Limit: 600
+X-RateLimit-Remaining: 599
+```
+
+Daily quota headers appear when the key has a quota:
+
+```http
+X-DailyQuota-Limit: 100000
+X-DailyQuota-Remaining: 99999
+X-DailyQuota-Reset: 1779993600
+```
+
+## Admin Requests with Header Auth
 
 ### Read Access Policy
 
@@ -59,6 +64,7 @@ $body = @{
   name = "Example Client"
   owner_email = "client@example.com"
   rate_limit_per_minute = 600
+  daily_quota = 100000
 } | ConvertTo-Json
 
 Invoke-RestMethod `
@@ -83,6 +89,24 @@ Invoke-RestMethod `
   -ContentType "application/json" `
   -Body $body
 ```
+
+### Compression Admin Endpoints
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:22417/api/v2/admin/compression/stats" `
+  -Headers @{ "X-Admin-Api-Key" = $env:ADMIN_API_KEY }
+```
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:22417/api/v2/admin/compression/logs?limit=50" `
+  -Headers @{ "X-Admin-Api-Key" = $env:ADMIN_API_KEY }
+```
+
+## Admin Requests with Session Auth
+
+The built-in `/admin` panel handles session cookies and CSRF tokens automatically. Custom browser clients must send the `X-CSRF-Token` returned by `/api/v2/admin/session` for `POST`, `PATCH`, `PUT`, and `DELETE` calls.
 
 ## Chart Query Options
 

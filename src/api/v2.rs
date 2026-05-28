@@ -25,22 +25,38 @@ pub async fn health() -> impl Responder {
 
 #[get("/ready")]
 pub async fn ready(state: web::Data<AppState>) -> impl Responder {
-    match state.db.run_command(doc! { "ping": 1 }).await {
-        Ok(_) => HttpResponse::Ok().json(json!({
-            "success": true,
-            "data": {
-                "mongo": "ok",
-                "redis": if state.config.redis_url.is_some() { "configured" } else { "not_configured" }
-            },
-            "error": null,
-            "timestamp": Utc::now()
-        })),
-        Err(e) => security::problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "readiness_failed",
-            &format!("MongoDB readiness check failed: {}", e),
-        ),
-    }
+    let mongo_ok = match state.db.run_command(doc! { "ping": 1 }).await {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("MongoDB readiness failed: {}", error);
+            false
+        }
+    };
+    let store = state.security_store.readiness().await;
+    let ready = mongo_ok && store.ready;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let data = if state.config.app_env.is_production() {
+        json!({ "status": if ready { "ok" } else { "degraded" } })
+    } else {
+        json!({
+            "status": if ready { "ok" } else { "degraded" },
+            "mongo": if mongo_ok { "ok" } else { "unavailable" },
+            "security_store": store.backend,
+            "redis_required": store.redis_required,
+            "redis_available": store.redis_available,
+        })
+    };
+
+    HttpResponse::build(status).json(json!({
+        "success": ready,
+        "data": data,
+        "error": null,
+        "timestamp": Utc::now()
+    }))
 }
 
 #[get("/api/v2/openapi.json")]
@@ -56,7 +72,17 @@ pub async fn openapi() -> impl Responder {
             "/api/v2/skyblock/bazaar/products/latest": { "get": { "summary": "Get latest data for many products" } },
             "/api/v2/skyblock/bazaar/products/{product_id}/latest": { "get": { "summary": "Get latest product data" } },
             "/api/v2/skyblock/bazaar/products/{product_id}/candles": { "get": { "summary": "Get OHLCV candles" } },
-            "/api/v2/skyblock/bazaar/products/{product_id}/series": { "get": { "summary": "Get chart series" } }
+            "/api/v2/skyblock/bazaar/products/{product_id}/series": { "get": { "summary": "Get chart series" } },
+            "/api/v2/admin/api-keys": { "get": { "summary": "List API keys" }, "post": { "summary": "Create API key" } },
+            "/api/v2/admin/access-policy": { "get": { "summary": "Read public access policy" }, "patch": { "summary": "Update public access policy" } },
+            "/api/v2/admin/compression/stats": { "get": { "summary": "Read compression stats" } },
+            "/api/v2/admin/compression/logs": { "get": { "summary": "Read compression logs" } }
+        },
+        "components": {
+            "securitySchemes": {
+                "userApiKey": { "type": "apiKey", "in": "header", "name": "X-API-Key" },
+                "adminApiKey": { "type": "apiKey", "in": "header", "name": "X-Admin-Api-Key" }
+            }
         }
     }))
 }
@@ -69,8 +95,8 @@ pub async fn list_products(req: HttpRequest, state: web::Data<AppState>) -> impl
     };
 
     let cache_key = "v2:products".to_string();
-    if let Some(value) = state.cache.get(&cache_key).await {
-        return security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit);
+    if let Some(value) = state.security_store.cache_get(&cache_key).await {
+        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
 
     match db::list_products_v2(&state.db).await {
@@ -78,16 +104,19 @@ pub async fn list_products(req: HttpRequest, state: web::Data<AppState>) -> impl
             let value =
                 serde_json::to_value(ApiResponse::success(products)).unwrap_or_else(|_| json!({}));
             state
-                .cache
-                .set(cache_key, value.clone(), StdDuration::from_secs(15))
+                .security_store
+                .cache_set(cache_key, value.clone(), StdDuration::from_secs(15))
                 .await;
-            security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit)
+            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
         }
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "products_query_failed",
-            &format!("Products could not be loaded: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("Products query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "products_query_failed",
+                "Products could not be loaded",
+            )
+        }
     }
 }
 
@@ -104,8 +133,8 @@ pub async fn latest_many(
 
     let ids = parse_ids(query.ids.as_deref());
     let cache_key = format!("v2:latest-many:{}", ids.join(","));
-    if let Some(value) = state.cache.get(&cache_key).await {
-        return security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit);
+    if let Some(value) = state.security_store.cache_get(&cache_key).await {
+        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
 
     match db::get_latest_many_v2(&state.db, &ids).await {
@@ -113,16 +142,19 @@ pub async fn latest_many(
             let value =
                 serde_json::to_value(ApiResponse::success(data)).unwrap_or_else(|_| json!({}));
             state
-                .cache
-                .set(cache_key, value.clone(), StdDuration::from_secs(15))
+                .security_store
+                .cache_set(cache_key, value.clone(), StdDuration::from_secs(15))
                 .await;
-            security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit)
+            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
         }
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "latest_query_failed",
-            &format!("Latest data could not be loaded: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("Latest many query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "latest_query_failed",
+                "Latest data could not be loaded",
+            )
+        }
     }
 }
 
@@ -147,8 +179,8 @@ pub async fn latest_one(
     }
 
     let cache_key = format!("v2:latest:{}", product_id);
-    if let Some(value) = state.cache.get(&cache_key).await {
-        return security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit);
+    if let Some(value) = state.security_store.cache_get(&cache_key).await {
+        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
 
     match db::get_latest_bazaar_data_v2(&state.db, &product_id).await {
@@ -156,21 +188,24 @@ pub async fn latest_one(
             let value =
                 serde_json::to_value(ApiResponse::success(data)).unwrap_or_else(|_| json!({}));
             state
-                .cache
-                .set(cache_key, value.clone(), StdDuration::from_secs(15))
+                .security_store
+                .cache_set(cache_key, value.clone(), StdDuration::from_secs(15))
                 .await;
-            security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit)
+            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
         }
         Ok(None) => security::problem(
             StatusCode::NOT_FOUND,
             "product_not_found",
             "Product not found",
         ),
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "latest_query_failed",
-            &format!("Latest data could not be loaded: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("Latest one query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "latest_query_failed",
+                "Latest data could not be loaded",
+            )
+        }
     }
 }
 
@@ -201,8 +236,8 @@ pub async fn candles(
         window.end.timestamp(),
         window.limit
     );
-    if let Some(value) = state.cache.get(&cache_key).await {
-        return security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit);
+    if let Some(value) = state.security_store.cache_get(&cache_key).await {
+        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
 
     match db::get_candles(
@@ -224,16 +259,19 @@ pub async fn candles(
             let value =
                 serde_json::to_value(ApiResponse::success(points)).unwrap_or_else(|_| json!({}));
             state
-                .cache
-                .set(cache_key, value.clone(), StdDuration::from_secs(30))
+                .security_store
+                .cache_set(cache_key, value.clone(), StdDuration::from_secs(30))
                 .await;
-            security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit)
+            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
         }
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "candles_query_failed",
-            &format!("Candles could not be loaded: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("Candles query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "candles_query_failed",
+                "Candles could not be loaded",
+            )
+        }
     }
 }
 
@@ -273,8 +311,8 @@ pub async fn series(
         window.end.timestamp(),
         window.limit
     );
-    if let Some(value) = state.cache.get(&cache_key).await {
-        return security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit);
+    if let Some(value) = state.security_store.cache_get(&cache_key).await {
+        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
 
     match db::get_candles(
@@ -296,16 +334,19 @@ pub async fn series(
             let value =
                 serde_json::to_value(ApiResponse::success(points)).unwrap_or_else(|_| json!({}));
             state
-                .cache
-                .set(cache_key, value.clone(), StdDuration::from_secs(30))
+                .security_store
+                .cache_set(cache_key, value.clone(), StdDuration::from_secs(30))
                 .await;
-            security::with_rate_limit_headers(HttpResponse::Ok().json(value), &auth.rate_limit)
+            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
         }
-        Err(e) => security::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "series_query_failed",
-            &format!("Series could not be loaded: {}", e),
-        ),
+        Err(error) => {
+            eprintln!("Series query failed: {}", error);
+            security::problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "series_query_failed",
+                "Series could not be loaded",
+            )
+        }
     }
 }
 
@@ -361,6 +402,15 @@ fn parse_chart_window(product_id: &str, query: &ChartQuery) -> Result<ChartWindo
         ));
     }
 
+    let range = end - start;
+    if range > max_range_for_interval(interval) {
+        return Err(security::problem(
+            StatusCode::BAD_REQUEST,
+            "range_too_large",
+            "Requested range is too large for the selected interval",
+        ));
+    }
+
     Ok(ChartWindow {
         interval: interval.to_string(),
         metric: metric.to_string(),
@@ -390,14 +440,25 @@ fn parse_range(value: &str) -> Result<Duration, HttpResponse> {
     let amount = amount.parse::<i64>().map_err(|_| {
         security::problem(StatusCode::BAD_REQUEST, "invalid_range", "Invalid range")
     })?;
+    if amount <= 0 {
+        return Err(security::problem(
+            StatusCode::BAD_REQUEST,
+            "invalid_range",
+            "Range amount must be positive",
+        ));
+    }
     let duration = match unit {
         "s" => Duration::seconds(amount),
         "m" => Duration::minutes(amount),
         "h" => Duration::hours(amount),
         "d" => Duration::days(amount),
         "w" => Duration::weeks(amount),
-        "mo" => Duration::days(amount * 30),
-        "y" => Duration::days(amount * 365),
+        "mo" => Duration::days(amount.checked_mul(30).ok_or_else(|| {
+            security::problem(StatusCode::BAD_REQUEST, "invalid_range", "Invalid range")
+        })?),
+        "y" => Duration::days(amount.checked_mul(365).ok_or_else(|| {
+            security::problem(StatusCode::BAD_REQUEST, "invalid_range", "Invalid range")
+        })?),
         _ => {
             return Err(security::problem(
                 StatusCode::BAD_REQUEST,
@@ -407,6 +468,17 @@ fn parse_range(value: &str) -> Result<Duration, HttpResponse> {
         }
     };
     Ok(duration)
+}
+
+fn max_range_for_interval(interval: &str) -> Duration {
+    match interval {
+        "15s" => Duration::hours(24),
+        "1m" => Duration::days(30),
+        "5m" | "15m" => Duration::days(180),
+        "1h" => Duration::days(365 * 5),
+        "1d" | "1w" | "1mo" => Duration::days(365 * 100),
+        _ => Duration::days(1),
+    }
 }
 
 fn candle_point(candle: BazaarCandle) -> CandlePoint {

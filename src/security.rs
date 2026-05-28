@@ -1,29 +1,75 @@
+use crate::config::AppConfig;
 use crate::db;
-use crate::models::ProblemResponse;
-use crate::state::{AppState, RateLimitOutcome};
-use actix_web::http::StatusCode;
+use crate::models::{AccessPolicy, ProblemResponse};
+use crate::shared_store::{DailyQuotaOutcome, RateLimitOutcome};
+use crate::state::AppState;
 use actix_web::http::header::{HeaderName, HeaderValue};
+use actix_web::http::{Method, StatusCode};
 use actix_web::{HttpRequest, HttpResponse};
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::net::IpAddr;
 use std::time::Duration;
+
+type HmacSha256 = Hmac<Sha256>;
 
 pub const USER_API_KEY_HEADER: &str = "X-API-Key";
 pub const ADMIN_API_KEY_HEADER: &str = "X-Admin-Api-Key";
+pub const ADMIN_CSRF_HEADER: &str = "X-CSRF-Token";
 pub const ADMIN_SESSION_COOKIE: &str = "bazaar_admin_session";
+pub const SECURE_ADMIN_SESSION_COOKIE: &str = "__Host-bazaar_admin_session";
+
+const ACCESS_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
+const ADMIN_LOGIN_MINUTE_LIMIT: u32 = 5;
+const ADMIN_LOGIN_HOUR_LIMIT: u32 = 50;
+const ADMIN_API_RATE_LIMIT: u32 = 120;
 
 #[derive(Debug, Clone)]
 pub struct RequestAuth {
     pub rate_limit: RateLimitOutcome,
+    pub daily_quota: Option<DailyQuotaOutcome>,
 }
 
-pub fn hash_api_key(key: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyHashStatus {
+    Current,
+    Legacy,
+    Invalid,
+}
+
+pub fn hash_api_key(key: &str, config: &AppConfig) -> String {
+    let mut mac = HmacSha256::new_from_slice(config.api_key_hash_pepper.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(key.as_bytes());
+    format!("hmac-sha256:{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+pub fn legacy_hash_api_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     hex::encode(hasher.finalize())
 }
 
-pub fn generate_user_api_key() -> (String, String, String) {
+pub fn verify_api_key_hash(
+    stored_hash: &str,
+    raw_key: &str,
+    config: &AppConfig,
+) -> ApiKeyHashStatus {
+    let current_hash = hash_api_key(raw_key, config);
+    if constant_time_eq(stored_hash, &current_hash) {
+        return ApiKeyHashStatus::Current;
+    }
+
+    let legacy_hash = legacy_hash_api_key(raw_key);
+    if !stored_hash.starts_with("hmac-sha256:") && constant_time_eq(stored_hash, &legacy_hash) {
+        return ApiKeyHashStatus::Legacy;
+    }
+
+    ApiKeyHashStatus::Invalid
+}
+
+pub fn generate_user_api_key(config: &AppConfig) -> (String, String, String) {
     let prefix = uuid::Uuid::new_v4()
         .simple()
         .to_string()
@@ -36,14 +82,20 @@ pub fn generate_user_api_key() -> (String, String, String) {
         uuid::Uuid::new_v4().simple()
     );
     let key = format!("bzusr_{}_{}", prefix, secret);
-    let hash = hash_api_key(&key);
+    let hash = hash_api_key(&key, config);
     (key, prefix, hash)
 }
 
 pub fn parse_api_key_prefix(key: &str) -> Option<&str> {
     let mut parts = key.split('_');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("bzusr"), Some(prefix), Some(_)) if !prefix.is_empty() => Some(prefix),
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("bzusr"), Some(prefix), Some(secret), None)
+            if prefix.len() == 10
+                && prefix.chars().all(|ch| ch.is_ascii_hexdigit())
+                && !secret.is_empty() =>
+        {
+            Some(prefix)
+        }
         _ => None,
     }
 }
@@ -63,27 +115,27 @@ pub fn problem(status: StatusCode, code: &str, message: &str) -> HttpResponse {
     HttpResponse::build(status).json(ProblemResponse::new(code, message, status.as_u16()))
 }
 
+pub fn with_auth_headers(mut response: HttpResponse, auth: &RequestAuth) -> HttpResponse {
+    add_rate_limit_headers(&mut response, &auth.rate_limit);
+    if let Some(quota) = &auth.daily_quota {
+        add_daily_quota_headers(&mut response, quota);
+    }
+    response
+}
+
 pub fn with_rate_limit_headers(
     mut response: HttpResponse,
     rate_limit: &RateLimitOutcome,
 ) -> HttpResponse {
-    if let Ok(value) = HeaderValue::from_str(&rate_limit.limit.to_string()) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-ratelimit-limit"), value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&rate_limit.remaining.to_string()) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-ratelimit-remaining"), value);
-    }
-    if !rate_limit.allowed {
-        if let Ok(value) = HeaderValue::from_str(&rate_limit.retry_after_seconds.to_string()) {
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("retry-after"), value);
-        }
-    }
+    add_rate_limit_headers(&mut response, rate_limit);
+    response
+}
+
+pub fn with_daily_quota_headers(
+    mut response: HttpResponse,
+    quota: &DailyQuotaOutcome,
+) -> HttpResponse {
+    add_daily_quota_headers(&mut response, quota);
     response
 }
 
@@ -92,20 +144,7 @@ pub async fn authorize_public(
     state: &AppState,
     required_scope: &str,
 ) -> Result<RequestAuth, HttpResponse> {
-    let policy = match state.access_policy_cache.get().await {
-        Some(policy) => policy,
-        None => {
-            let policy = db::get_access_policy(&state.db).await.map_err(|_| {
-                problem(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "access_policy_error",
-                    "Access policy could not be loaded",
-                )
-            })?;
-            state.access_policy_cache.set(policy.clone()).await;
-            policy
-        }
-    };
+    let policy = load_access_policy(state).await?;
 
     if let Some(raw_key) = header_value(req, USER_API_KEY_HEADER) {
         if state
@@ -130,7 +169,8 @@ pub async fn authorize_public(
         })?;
         let record = db::find_api_key_by_prefix(&state.db, prefix)
             .await
-            .map_err(|_| {
+            .map_err(|error| {
+                eprintln!("API key lookup failed: {}", error);
                 problem(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "api_key_lookup_error",
@@ -145,13 +185,24 @@ pub async fn authorize_public(
                 )
             })?;
 
-        if !constant_time_eq(&record.key_hash, &hash_api_key(raw_key)) {
-            return Err(problem(
-                StatusCode::UNAUTHORIZED,
-                "invalid_api_key",
-                "Invalid API key",
-            ));
+        let id = record.id.as_ref().map(|id| id.to_hex()).unwrap_or_default();
+        match verify_api_key_hash(&record.key_hash, raw_key, &state.config) {
+            ApiKeyHashStatus::Current => {}
+            ApiKeyHashStatus::Legacy => {
+                let new_hash = hash_api_key(raw_key, &state.config);
+                if let Err(error) = db::update_api_key_hash(&state.db, &id, new_hash).await {
+                    eprintln!("API key hash migration failed for {}: {}", id, error);
+                }
+            }
+            ApiKeyHashStatus::Invalid => {
+                return Err(problem(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_api_key",
+                    "Invalid API key",
+                ));
+            }
         }
+
         if record.status != "active" {
             return Err(problem(
                 StatusCode::FORBIDDEN,
@@ -177,16 +228,13 @@ pub async fn authorize_public(
             ));
         }
 
-        let id = record.id.map(|id| id.to_hex()).unwrap_or_default();
-        let rate_limit = state
-            .rate_limiter
-            .check(
-                &format!("api-key:{}", id),
-                record.rate_limit_per_minute,
-                Duration::from_secs(60),
-            )
-            .await;
-
+        let rate_limit = check_rate_limit_or_503(
+            state,
+            &format!("api-key:{}", id),
+            record.rate_limit_per_minute,
+            Duration::from_secs(60),
+        )
+        .await?;
         if !rate_limit.allowed {
             return Err(with_rate_limit_headers(
                 problem(
@@ -198,8 +246,28 @@ pub async fn authorize_public(
             ));
         }
 
+        let daily_quota = if let Some(limit) = record.daily_quota {
+            let quota = check_daily_quota_or_503(state, &format!("api-key:{}", id), limit).await?;
+            if !quota.allowed {
+                return Err(with_daily_quota_headers(
+                    problem(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "quota_exceeded",
+                        "Daily quota exceeded",
+                    ),
+                    &quota,
+                ));
+            }
+            Some(quota)
+        } else {
+            None
+        };
+
         let _ = db::touch_api_key_last_used(&state.db, &id).await;
-        return Ok(RequestAuth { rate_limit });
+        return Ok(RequestAuth {
+            rate_limit,
+            daily_quota,
+        });
     }
 
     if !policy.anonymous_public_enabled {
@@ -211,14 +279,13 @@ pub async fn authorize_public(
     }
 
     let ip = request_ip(req, state);
-    let rate_limit = state
-        .rate_limiter
-        .check(
-            &format!("anonymous:{}", ip),
-            policy.anonymous_rate_limit_per_minute,
-            Duration::from_secs(60),
-        )
-        .await;
+    let rate_limit = check_rate_limit_or_503(
+        state,
+        &format!("anonymous:{}", ip),
+        policy.anonymous_rate_limit_per_minute,
+        Duration::from_secs(60),
+    )
+    .await?;
 
     if !rate_limit.allowed {
         return Err(with_rate_limit_headers(
@@ -231,7 +298,54 @@ pub async fn authorize_public(
         ));
     }
 
-    Ok(RequestAuth { rate_limit })
+    Ok(RequestAuth {
+        rate_limit,
+        daily_quota: None,
+    })
+}
+
+pub async fn check_admin_login_rate_limit(
+    req: &HttpRequest,
+    state: &AppState,
+) -> Result<(), HttpResponse> {
+    let ip = request_ip(req, state);
+    let minute = check_rate_limit_or_503(
+        state,
+        &format!("admin-login-minute:{}", ip),
+        ADMIN_LOGIN_MINUTE_LIMIT,
+        Duration::from_secs(60),
+    )
+    .await?;
+    if !minute.allowed {
+        return Err(with_rate_limit_headers(
+            problem(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Too many admin login attempts",
+            ),
+            &minute,
+        ));
+    }
+
+    let hour = check_rate_limit_or_503(
+        state,
+        &format!("admin-login-hour:{}", ip),
+        ADMIN_LOGIN_HOUR_LIMIT,
+        Duration::from_secs(60 * 60),
+    )
+    .await?;
+    if !hour.allowed {
+        return Err(with_rate_limit_headers(
+            problem(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Too many admin login attempts",
+            ),
+            &hour,
+        ));
+    }
+
+    Ok(())
 }
 
 pub async fn authorize_admin(req: &HttpRequest, state: &AppState) -> Result<(), HttpResponse> {
@@ -244,7 +358,43 @@ pub async fn authorize_admin(req: &HttpRequest, state: &AppState) -> Result<(), 
     })?;
 
     if let Some(raw_key) = header_value(req, ADMIN_API_KEY_HEADER) {
+        let ip = request_ip(req, state);
+        let attempt_limit = check_rate_limit_or_503(
+            state,
+            &format!("admin-api-key-attempt:{}", ip),
+            ADMIN_API_RATE_LIMIT,
+            Duration::from_secs(60),
+        )
+        .await?;
+        if !attempt_limit.allowed {
+            return Err(with_rate_limit_headers(
+                problem(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "Rate limit exceeded",
+                ),
+                &attempt_limit,
+            ));
+        }
+
         if constant_time_eq(configured_key, raw_key) {
+            let key_limit = check_rate_limit_or_503(
+                state,
+                "admin-api-key:primary",
+                ADMIN_API_RATE_LIMIT,
+                Duration::from_secs(60),
+            )
+            .await?;
+            if !key_limit.allowed {
+                return Err(with_rate_limit_headers(
+                    problem(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limited",
+                        "Rate limit exceeded",
+                    ),
+                    &key_limit,
+                ));
+            }
             return Ok(());
         }
         return Err(problem(
@@ -254,8 +404,46 @@ pub async fn authorize_admin(req: &HttpRequest, state: &AppState) -> Result<(), 
         ));
     }
 
-    if let Some(cookie) = req.cookie(ADMIN_SESSION_COOKIE) {
-        if state.admin_sessions.verify(cookie.value()).await {
+    let cookie_name = admin_session_cookie_name(&state.config);
+    if let Some(cookie) = req.cookie(cookie_name) {
+        let csrf_token = state
+            .security_store
+            .verify_admin_session(cookie.value())
+            .await
+            .map_err(|error| {
+                eprintln!("Admin session verification failed: {}", error);
+                security_store_unavailable()
+            })?;
+        if let Some(csrf_token) = csrf_token {
+            let rate_limit = check_rate_limit_or_503(
+                state,
+                &format!("admin-session:{}", stable_hash(cookie.value())),
+                ADMIN_API_RATE_LIMIT,
+                Duration::from_secs(60),
+            )
+            .await?;
+            if !rate_limit.allowed {
+                return Err(with_rate_limit_headers(
+                    problem(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limited",
+                        "Rate limit exceeded",
+                    ),
+                    &rate_limit,
+                ));
+            }
+
+            if state_changing(req.method()) {
+                let provided = header_value(req, ADMIN_CSRF_HEADER).unwrap_or("");
+                if !constant_time_eq(&csrf_token, provided) {
+                    return Err(problem(
+                        StatusCode::FORBIDDEN,
+                        "csrf_required",
+                        "A valid CSRF token is required",
+                    ));
+                }
+            }
+
             return Ok(());
         }
     }
@@ -287,38 +475,226 @@ pub fn verify_admin_key(raw_key: &str, state: &AppState) -> Result<(), HttpRespo
     }
 }
 
-fn header_value<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
+pub fn admin_session_cookie_name(config: &AppConfig) -> &'static str {
+    if config.admin_cookie_secure {
+        SECURE_ADMIN_SESSION_COOKIE
+    } else {
+        ADMIN_SESSION_COOKIE
+    }
+}
+
+pub fn header_value<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
     req.headers()
         .get(name)
         .and_then(|value| value.to_str().ok())
 }
 
-fn request_ip(req: &HttpRequest, state: &AppState) -> String {
-    if state.config.trust_proxy {
+pub fn request_ip(req: &HttpRequest, state: &AppState) -> String {
+    let peer_ip = req.peer_addr().map(|addr| addr.ip());
+    if state.config.trust_proxy && peer_ip.is_some_and(|ip| trusted_proxy(ip, &state.config)) {
         if let Some(forwarded_for) = header_value(req, "X-Forwarded-For") {
             if let Some(first_ip) = forwarded_for.split(',').next() {
                 let ip = first_ip.trim();
-                if !ip.is_empty() {
+                if !ip.is_empty() && ip.parse::<IpAddr>().is_ok() {
                     return ip.to_string();
                 }
             }
         }
     }
 
-    req.peer_addr()
-        .map(|addr| addr.ip().to_string())
+    peer_ip
+        .map(|addr| addr.to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+async fn load_access_policy(state: &AppState) -> Result<AccessPolicy, HttpResponse> {
+    match state.security_store.get_access_policy().await {
+        Ok(Some(policy)) => Ok(policy),
+        Ok(None) => {
+            let policy = db::get_access_policy(&state.db).await.map_err(|error| {
+                eprintln!("Access policy load failed: {}", error);
+                problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "access_policy_error",
+                    "Access policy could not be loaded",
+                )
+            })?;
+            state
+                .security_store
+                .set_access_policy(policy.clone(), ACCESS_POLICY_CACHE_TTL)
+                .await
+                .map_err(|error| {
+                    eprintln!("Access policy cache set failed: {}", error);
+                    security_store_unavailable()
+                })?;
+            Ok(policy)
+        }
+        Err(error) => {
+            eprintln!("Access policy cache failed: {}", error);
+            Err(security_store_unavailable())
+        }
+    }
+}
+
+async fn check_rate_limit_or_503(
+    state: &AppState,
+    key: &str,
+    limit: u32,
+    window: Duration,
+) -> Result<RateLimitOutcome, HttpResponse> {
+    state
+        .security_store
+        .check_rate_limit(key, limit, window)
+        .await
+        .map_err(|error| {
+            eprintln!("Rate limit check failed: {}", error);
+            security_store_unavailable()
+        })
+}
+
+async fn check_daily_quota_or_503(
+    state: &AppState,
+    key: &str,
+    limit: u32,
+) -> Result<DailyQuotaOutcome, HttpResponse> {
+    state
+        .security_store
+        .check_daily_quota(key, limit, Utc::now())
+        .await
+        .map_err(|error| {
+            eprintln!("Daily quota check failed: {}", error);
+            security_store_unavailable()
+        })
+}
+
+fn security_store_unavailable() -> HttpResponse {
+    problem(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "security_store_unavailable",
+        "Security store is unavailable",
+    )
+}
+
+fn add_rate_limit_headers(response: &mut HttpResponse, rate_limit: &RateLimitOutcome) {
+    if let Ok(value) = HeaderValue::from_str(&rate_limit.limit.to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-ratelimit-limit"), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&rate_limit.remaining.to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-ratelimit-remaining"), value);
+    }
+    if !rate_limit.allowed {
+        if let Ok(value) = HeaderValue::from_str(&rate_limit.retry_after_seconds.to_string()) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("retry-after"), value);
+        }
+    }
+}
+
+fn add_daily_quota_headers(response: &mut HttpResponse, quota: &DailyQuotaOutcome) {
+    if let Ok(value) = HeaderValue::from_str(&quota.limit.to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-dailyquota-limit"), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&quota.remaining.to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-dailyquota-remaining"), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&quota.reset_at.timestamp().to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-dailyquota-reset"), value);
+    }
+}
+
+fn state_changing(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PATCH | Method::PUT | Method::DELETE
+    )
+}
+
+fn trusted_proxy(ip: IpAddr, config: &AppConfig) -> bool {
+    config
+        .trusted_proxy_cidrs
+        .iter()
+        .any(|network| network.contains(&ip))
+}
+
+fn stable_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, generate_user_api_key, hash_api_key, parse_api_key_prefix};
+    use super::{
+        ApiKeyHashStatus, constant_time_eq, generate_user_api_key, legacy_hash_api_key,
+        parse_api_key_prefix, verify_api_key_hash,
+    };
+    use crate::config::{AppConfig, AppEnvironment};
+    use std::sync::Arc;
+
+    fn test_config() -> Arc<AppConfig> {
+        Arc::new(AppConfig {
+            mongodb_uri: "mongodb://localhost:27017".to_string(),
+            mongodb_db: "test".to_string(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            app_env: AppEnvironment::Development,
+            admin_api_key: Some("admin".to_string()),
+            cors_allowed_origins: vec![],
+            trust_proxy: false,
+            trusted_proxy_cidrs: vec![],
+            redis_url: None,
+            require_redis: false,
+            api_key_hash_pepper: "test-pepper".to_string(),
+            admin_cookie_secure: false,
+            cache_max_entries: 10,
+            rate_limit_max_keys: 10,
+            admin_json_limit_bytes: 16 * 1024,
+        })
+    }
 
     #[test]
     fn generated_user_key_can_be_hashed_and_parsed() {
-        let (key, prefix, hash) = generate_user_api_key();
+        let config = test_config();
+        let (key, prefix, hash) = generate_user_api_key(&config);
 
         assert_eq!(parse_api_key_prefix(&key), Some(prefix.as_str()));
-        assert!(constant_time_eq(&hash, &hash_api_key(&key)));
+        assert_eq!(
+            verify_api_key_hash(&hash, &key, &config),
+            ApiKeyHashStatus::Current
+        );
+    }
+
+    #[test]
+    fn legacy_key_hash_can_still_verify() {
+        let config = test_config();
+        let key = "bzusr_012345abcd_secret";
+        let legacy = legacy_hash_api_key(key);
+
+        assert_eq!(
+            verify_api_key_hash(&legacy, key, &config),
+            ApiKeyHashStatus::Legacy
+        );
+    }
+
+    #[test]
+    fn malformed_key_prefix_is_rejected() {
+        assert_eq!(parse_api_key_prefix("bzusr_short_secret"), None);
+        assert_eq!(parse_api_key_prefix("bzusr_012345abcd_secret_extra"), None);
+    }
+
+    #[test]
+    fn constant_time_comparison_works() {
+        assert!(constant_time_eq("same", "same"));
+        assert!(!constant_time_eq("same", "nope"));
     }
 }

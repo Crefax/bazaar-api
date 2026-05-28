@@ -478,6 +478,27 @@ pub async fn touch_api_key_last_used(
     Ok(())
 }
 
+pub async fn update_api_key_hash(
+    db: &Database,
+    id: &str,
+    key_hash: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let collection = db.collection::<ApiKeyRecord>("api_keys");
+    let object_id = ObjectId::parse_str(id)?;
+    collection
+        .update_one(
+            doc! { "_id": object_id },
+            doc! {
+                "$set": {
+                    "key_hash": key_hash,
+                    "updated_at": bson_datetime(Utc::now()),
+                }
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn update_api_key(
     db: &Database,
     id: &str,
@@ -541,6 +562,7 @@ pub async fn get_latest_bazaar_data(
 }
 
 // Pagination desteği ile veri getirme
+#[allow(dead_code)]
 pub async fn get_bazaar_data_paginated(
     db: &Database,
     product_id: &str,
@@ -644,6 +666,7 @@ pub async fn get_bazaar_data_paginated(
 }
 
 // Agregasyon ile özetlenmiş veriler (saatlik, günlük, haftalık, aylık)
+#[allow(dead_code)]
 pub async fn get_bazaar_data_aggregated(
     db: &Database,
     product_id: &str,
@@ -750,6 +773,7 @@ pub async fn get_bazaar_data_aggregated(
 }
 
 // Akıllı veri getirme - compressed data'dan veya raw data'dan otomatik seçim
+#[allow(dead_code)]
 pub async fn get_bazaar_data_smart(
     db: &Database,
     product_id: &str,
@@ -788,6 +812,7 @@ pub async fn get_bazaar_data_smart(
 }
 
 // Eski fonksiyon - geriye dönük uyumluluk için
+#[allow(dead_code)]
 pub async fn get_bazaar_data_by_timeframe(
     db: &Database,
     product_id: &str,

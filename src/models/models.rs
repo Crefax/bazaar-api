@@ -96,6 +96,7 @@ pub struct PaginationInfo {
     pub previous_cursor: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct PaginationQuery {
     pub page: Option<u32>,
@@ -104,6 +105,7 @@ pub struct PaginationQuery {
     pub _cursor: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TimeframeQuery {
     pub hours: Option<u32>,
@@ -112,6 +114,7 @@ pub struct TimeframeQuery {
     pub end_date: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct FilterQuery {
     pub min_price: Option<f64>,
@@ -388,6 +391,7 @@ impl<T> ApiResponse<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn success_with_pagination(data: T, pagination: PaginationInfo) -> Self {
         Self {
             success: true,
@@ -398,6 +402,7 @@ impl<T> ApiResponse<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn error(message: String) -> Self {
         Self {
             success: false,

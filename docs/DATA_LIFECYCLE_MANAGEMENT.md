@@ -38,7 +38,7 @@ Tracked fields:
 | `bazaar` | Raw changed snapshots for recent high-resolution history. |
 | `bazaar_latest` | One current snapshot per product for fast latest-price queries. |
 | `bazaar_candles` | Materialized candles keyed by product, interval, metric, and period start. |
-| `api_keys` | Hashed user API keys and per-key rate limit settings. |
+| `api_keys` | HMAC-hashed user API keys, per-key rate limits, and daily quotas. |
 | `api_settings` | Public API access policy. |
 
 ## Candle Model
@@ -115,12 +115,13 @@ GET /api/v2/skyblock/bazaar/products/WHEAT/candles?interval=1mo&range=20y&metric
 - Latest price endpoints read from `bazaar_latest`, not from sorted raw history.
 - Chart endpoints read from `bazaar_candles`, not from request-time aggregation over raw snapshots.
 - Candle indexes are optimized for `product_id + interval + metric + period_start`.
-- Public endpoints use in-process cache and rate-limit fallback.
-- `REDIS_URL` is reserved for optional Redis wiring; when Redis is not wired, the service remains functional with local fallback.
+- Public endpoints use the shared security store for response cache, rate limits, daily quotas, and policy cache.
+- `REDIS_URL` enables Redis-backed shared cache/rate-limit/session behavior. Redis is required for production or multi-instance deployments.
+- Without Redis, the service uses bounded in-memory fallback intended for local development only.
 
 ## Operational Notes
 
-- `GET /ready` checks MongoDB connectivity.
+- `GET /ready` checks MongoDB and required security-store connectivity.
 - The retention scheduler runs hourly.
 - Daily, weekly, and monthly candles are not deleted by the retention scheduler.
-- User API key secrets are never stored in plaintext; only hashes and prefixes are stored.
+- User API key secrets are never stored in plaintext; only prefixes and HMAC hashes are stored.
