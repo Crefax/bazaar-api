@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::models::AccessPolicy;
 use mongodb::Database;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub rate_limiter: Arc<MemoryRateLimiter>,
     pub cache: Arc<MemoryCache>,
+    pub access_policy_cache: Arc<AccessPolicyCache>,
     pub admin_sessions: Arc<AdminSessionStore>,
     pub last_snapshot: Arc<RwLock<HashMap<String, ProductSnapshot>>>,
 }
@@ -41,9 +43,53 @@ impl AppState {
             http_client: reqwest::Client::new(),
             rate_limiter: Arc::new(MemoryRateLimiter::default()),
             cache: Arc::new(MemoryCache::default()),
+            access_policy_cache: Arc::new(AccessPolicyCache::new(Duration::from_secs(30))),
             admin_sessions: Arc::new(AdminSessionStore::default()),
             last_snapshot: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AccessPolicyCacheEntry {
+    policy: AccessPolicy,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct AccessPolicyCache {
+    ttl: Duration,
+    entry: RwLock<Option<AccessPolicyCacheEntry>>,
+}
+
+impl AccessPolicyCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entry: RwLock::new(None),
+        }
+    }
+
+    pub async fn get(&self) -> Option<AccessPolicy> {
+        let entry = self.entry.read().await;
+        entry
+            .as_ref()
+            .filter(|cached| cached.expires_at > Instant::now())
+            .map(|cached| cached.policy.clone())
+    }
+
+    pub async fn set(&self, policy: AccessPolicy) {
+        let mut entry = self.entry.write().await;
+        *entry = Some(AccessPolicyCacheEntry {
+            policy,
+            expires_at: Instant::now() + self.ttl,
+        });
+    }
+
+    #[allow(dead_code)]
+    pub async fn invalidate(&self) {
+        let mut entry = self.entry.write().await;
+        *entry = None;
     }
 }
 
@@ -193,7 +239,8 @@ impl AdminSessionStore {
 
 #[cfg(test)]
 mod tests {
-    use super::MemoryRateLimiter;
+    use super::{AccessPolicyCache, MemoryRateLimiter};
+    use crate::models::AccessPolicy;
     use std::time::Duration;
 
     #[tokio::test]
@@ -218,5 +265,15 @@ mod tests {
                 .await
                 .allowed
         );
+    }
+
+    #[tokio::test]
+    async fn access_policy_cache_expires_entries() {
+        let cache = AccessPolicyCache::new(Duration::from_millis(10));
+        cache.set(AccessPolicy::default()).await;
+
+        assert!(cache.get().await.is_some());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(cache.get().await.is_none());
     }
 }

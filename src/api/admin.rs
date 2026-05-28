@@ -288,7 +288,10 @@ pub async fn get_access_policy(req: HttpRequest, state: web::Data<AppState>) -> 
     }
 
     match db::get_access_policy(&state.db).await {
-        Ok(policy) => HttpResponse::Ok().json(ApiResponse::success(AccessPolicyView::from(policy))),
+        Ok(policy) => {
+            state.access_policy_cache.set(policy.clone()).await;
+            HttpResponse::Ok().json(ApiResponse::success(AccessPolicyView::from(policy)))
+        }
         Err(e) => security::problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "access_policy_error",
@@ -315,7 +318,10 @@ pub async fn update_access_policy(
     )
     .await
     {
-        Ok(policy) => HttpResponse::Ok().json(ApiResponse::success(AccessPolicyView::from(policy))),
+        Ok(policy) => {
+            state.access_policy_cache.set(policy.clone()).await;
+            HttpResponse::Ok().json(ApiResponse::success(AccessPolicyView::from(policy)))
+        }
         Err(e) => security::problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "access_policy_update_failed",

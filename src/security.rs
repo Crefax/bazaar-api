@@ -92,13 +92,20 @@ pub async fn authorize_public(
     state: &AppState,
     required_scope: &str,
 ) -> Result<RequestAuth, HttpResponse> {
-    let policy = db::get_access_policy(&state.db).await.map_err(|_| {
-        problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "access_policy_error",
-            "Access policy could not be loaded",
-        )
-    })?;
+    let policy = match state.access_policy_cache.get().await {
+        Some(policy) => policy,
+        None => {
+            let policy = db::get_access_policy(&state.db).await.map_err(|_| {
+                problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "access_policy_error",
+                    "Access policy could not be loaded",
+                )
+            })?;
+            state.access_policy_cache.set(policy.clone()).await;
+            policy
+        }
+    };
 
     if let Some(raw_key) = header_value(req, USER_API_KEY_HEADER) {
         if state
