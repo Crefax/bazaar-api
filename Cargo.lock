@@ -315,13 +315,17 @@ version = "0.2.0"
 dependencies = [
  "actix-cors",
  "actix-web",
+ "bson",
  "chrono",
  "futures",
+ "hex",
  "mongodb",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -390,6 +394,7 @@ dependencies = [
  "ahash",
  "base64",
  "bitvec",
+ "chrono",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "hex",
