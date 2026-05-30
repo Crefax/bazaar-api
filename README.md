@@ -10,7 +10,7 @@ Bazaar API is a Rust/Actix service for tracking Hypixel SkyBlock Bazaar market d
 - User API keys with HMAC-hashed storage, one-time secret display, rotate/revoke support, per-key rate limits, and daily quotas.
 - Anonymous public access with configurable low rate limits.
 - Shared Redis-backed security store for production/multi-instance deployments, with bounded in-memory fallback for local development.
-- 15-second tracker cadence with duplicate snapshot skipping.
+- 15-second tracker cadence with conditional Hypixel fetches and duplicate snapshot skipping.
 - MongoDB latest snapshots and materialized candles for fast chart reads.
 - Minimal health/readiness endpoints.
 
@@ -202,7 +202,7 @@ MongoDB collections used by the v2 runtime:
 |---|---|
 | `bazaar` | Raw changed snapshots. |
 | `bazaar_latest` | One latest snapshot per product. |
-| `bazaar_candles` | Materialized chart candles by product, interval, metric, and period. |
+| `bazaar_candles` | Materialized chart candles by product, interval, and period, with all metrics in one document. |
 | `api_keys` | Hashed user API keys and per-key limits/quotas. |
 | `api_settings` | Public access policy. |
 | `compression_log` | Compression/admin statistics support. |
@@ -217,6 +217,8 @@ Retention behavior:
 | 5-minute and 15-minute candles | 180 days |
 | 1-hour candles | 5 years |
 | Daily, weekly, monthly candles | Indefinite |
+
+Tracker writes only raw snapshots, latest snapshots, and 15-second candles. A rollup worker materializes 1-minute and lower-resolution candles from closed periods.
 
 ## Development Checks
 

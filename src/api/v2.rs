@@ -1,5 +1,7 @@
 use crate::db;
-use crate::models::{ApiResponse, BazaarCandle, CandlePoint, ChartQuery, LatestQuery, SeriesPoint};
+use crate::models::{
+    ApiResponse, BazaarCandle, CandleMetric, CandlePoint, ChartQuery, LatestQuery, SeriesPoint,
+};
 use crate::security;
 use crate::state::AppState;
 use actix_web::http::StatusCode;
@@ -10,6 +12,7 @@ use serde_json::json;
 use std::time::Duration as StdDuration;
 
 const BAZAAR_READ_SCOPE: &str = "bazaar:read";
+const PUBLIC_CACHE_VERSION: &str = "v3";
 
 #[get("/health")]
 pub async fn health() -> impl Responder {
@@ -94,7 +97,7 @@ pub async fn list_products(req: HttpRequest, state: web::Data<AppState>) -> impl
         Err(response) => return response,
     };
 
-    let cache_key = "v2:products".to_string();
+    let cache_key = format!("{PUBLIC_CACHE_VERSION}:products");
     if let Some(value) = state.security_store.cache_get(&cache_key).await {
         return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
@@ -132,7 +135,7 @@ pub async fn latest_many(
     };
 
     let ids = parse_ids(query.ids.as_deref());
-    let cache_key = format!("v2:latest-many:{}", ids.join(","));
+    let cache_key = format!("{PUBLIC_CACHE_VERSION}:latest-many:{}", ids.join(","));
     if let Some(value) = state.security_store.cache_get(&cache_key).await {
         return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
@@ -178,7 +181,7 @@ pub async fn latest_one(
         );
     }
 
-    let cache_key = format!("v2:latest:{}", product_id);
+    let cache_key = format!("{PUBLIC_CACHE_VERSION}:latest:{}", product_id);
     if let Some(value) = state.security_store.cache_get(&cache_key).await {
         return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
     }
@@ -228,7 +231,7 @@ pub async fn candles(
     };
 
     let cache_key = format!(
-        "v2:candles:{}:{}:{}:{}:{}:{}",
+        "{PUBLIC_CACHE_VERSION}:candles:{}:{}:{}:{}:{}:{}",
         product_id,
         window.interval,
         window.metric,
@@ -254,7 +257,7 @@ pub async fn candles(
         Ok(candle_rows) => {
             let points = candle_rows
                 .into_iter()
-                .map(candle_point)
+                .map(|candle| candle_point(candle, &window.metric))
                 .collect::<Vec<_>>();
             let value =
                 serde_json::to_value(ApiResponse::success(points)).unwrap_or_else(|_| json!({}));
@@ -302,7 +305,7 @@ pub async fn series(
     }
 
     let cache_key = format!(
-        "v2:series:{}:{}:{}:{}:{}:{}:{}",
+        "{PUBLIC_CACHE_VERSION}:series:{}:{}:{}:{}:{}:{}:{}",
         product_id,
         window.interval,
         window.metric,
@@ -329,7 +332,7 @@ pub async fn series(
         Ok(candle_rows) => {
             let points = candle_rows
                 .into_iter()
-                .map(|candle| series_point(candle, stat))
+                .map(|candle| series_point(candle, &window.metric, stat))
                 .collect::<Vec<_>>();
             let value =
                 serde_json::to_value(ApiResponse::success(points)).unwrap_or_else(|_| json!({}));
@@ -481,39 +484,50 @@ fn max_range_for_interval(interval: &str) -> Duration {
     }
 }
 
-fn candle_point(candle: BazaarCandle) -> CandlePoint {
+fn candle_point(candle: BazaarCandle, metric: &str) -> CandlePoint {
+    let metric = candle_metric(&candle, metric);
     CandlePoint {
         t: candle.period_start,
         period_end: candle.period_end,
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
+        open: metric.open,
+        high: metric.high,
+        low: metric.low,
+        close: metric.close,
         volume: candle.volume,
-        samples: candle.sample_count,
+        samples: metric.sample_count,
     }
 }
 
-fn series_point(candle: BazaarCandle, stat: &str) -> SeriesPoint {
+fn series_point(candle: BazaarCandle, metric: &str, stat: &str) -> SeriesPoint {
+    let metric = candle_metric(&candle, metric);
     let value = match stat {
-        "open" => candle.open,
-        "high" => candle.high,
-        "low" => candle.low,
+        "open" => metric.open,
+        "high" => metric.high,
+        "low" => metric.low,
         "avg" => {
-            if candle.sample_count > 0 {
-                candle.value_sum / candle.sample_count as f64
+            if metric.sample_count > 0 {
+                metric.value_sum / metric.sample_count as f64
             } else {
-                candle.close
+                metric.close
             }
         }
         "volume" => candle.volume as f64,
-        _ => candle.close,
+        _ => metric.close,
     };
 
     SeriesPoint {
         t: candle.period_start,
         value,
-        samples: candle.sample_count,
+        samples: metric.sample_count,
+    }
+}
+
+fn candle_metric<'a>(candle: &'a BazaarCandle, metric: &str) -> &'a CandleMetric {
+    match metric {
+        "buy_price" => &candle.buy_price,
+        "sell_price" => &candle.sell_price,
+        "spread" => &candle.spread,
+        _ => &candle.mid_price,
     }
 }
 

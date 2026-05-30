@@ -22,6 +22,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub security_store: SharedSecurityStore,
     pub last_snapshot: Arc<RwLock<HashMap<String, ProductSnapshot>>>,
+    pub hypixel_last_modified: Arc<RwLock<Option<String>>>,
+    pub hypixel_last_updated: Arc<RwLock<Option<i64>>>,
 }
 
 impl AppState {
@@ -33,12 +35,19 @@ impl AppState {
             }
         }
 
+        let http_client = reqwest::Client::builder()
+            .gzip(true)
+            .build()
+            .expect("failed to build HTTP client");
+
         Self {
             db,
             config,
-            http_client: reqwest::Client::new(),
+            http_client,
             security_store,
             last_snapshot: Arc::new(RwLock::new(HashMap::new())),
+            hypixel_last_modified: Arc::new(RwLock::new(None)),
+            hypixel_last_updated: Arc::new(RwLock::new(None)),
         }
     }
 }

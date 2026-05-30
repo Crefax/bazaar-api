@@ -20,7 +20,8 @@ For each product:
 3. Skip the product if all tracked fields are unchanged.
 4. Store changed snapshots in `bazaar`.
 5. Upsert the current product state into `bazaar_latest`.
-6. Upsert chart candles into `bazaar_candles`.
+6. Upsert only 15-second chart candles into `bazaar_candles`.
+7. Roll closed candle periods into lower-resolution candles in a separate scheduler.
 
 Tracked fields:
 
@@ -43,7 +44,7 @@ Tracked fields:
 
 ## Candle Model
 
-Candles are stored per product, interval, and metric.
+Candles are stored per product, interval, and period start. Each candle document contains all metric payloads, which avoids creating one document per metric.
 
 Supported intervals:
 
@@ -57,16 +58,23 @@ Supported metrics:
 buy_price, sell_price, mid_price, spread
 ```
 
-Each candle stores:
+Each metric inside a candle stores:
 
 - `open`
 - `high`
 - `low`
 - `close`
-- `volume`
+- `value_sum`
 - `sample_count`
+
+Each candle also stores:
+
+- `volume`
+- `buy_volume_sum`
+- `sell_volume_sum`
 - `period_start`
 - `period_end`
+- `expires_at` for retention-managed resolutions
 
 ## Retention Profile
 
@@ -122,6 +130,7 @@ GET /api/v2/skyblock/bazaar/products/WHEAT/candles?interval=1mo&range=20y&metric
 ## Operational Notes
 
 - `GET /ready` checks MongoDB and required security-store connectivity.
-- The retention scheduler runs hourly.
-- Daily, weekly, and monthly candles are not deleted by the retention scheduler.
+- The rollup scheduler runs once per minute and processes only closed periods.
+- Retention is handled by MongoDB TTL indexes on `expires_at`.
+- Daily, weekly, and monthly candles do not receive `expires_at`, so TTL does not delete them.
 - User API key secrets are never stored in plaintext; only prefixes and HMAC hashes are stored.

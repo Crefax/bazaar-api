@@ -213,6 +213,7 @@ impl SharedSecurityStore {
         self.memory.cache_set(key, value, ttl).await;
     }
 
+    #[allow(dead_code)]
     pub async fn cache_remove_prefix(&self, prefix: &str) {
         if let Some(redis) = &self.redis {
             match redis.cache_remove_prefix(prefix).await {
@@ -229,6 +230,48 @@ impl SharedSecurityStore {
         }
 
         self.memory.cache_remove_prefix(prefix).await;
+    }
+
+    pub async fn acquire_lock(&self, key: &str, ttl: Duration) -> StoreResult<Option<String>> {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        if let Some(redis) = &self.redis {
+            match redis.acquire_lock(key, &token, ttl).await {
+                Ok(true) => return Ok(Some(token)),
+                Ok(false) => return Ok(None),
+                Err(error) if self.redis_required => return Err(error),
+                Err(error) => eprintln!("Redis lock failed, falling back to memory: {}", error),
+            }
+        } else if self.redis_required {
+            return Err(SecurityStoreError::new(
+                "Redis is required but not available",
+            ));
+        }
+
+        if self.memory.acquire_lock(key, &token, ttl).await {
+            Ok(Some(token))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn release_lock(&self, key: &str, token: &str) -> StoreResult<()> {
+        if let Some(redis) = &self.redis {
+            match redis.release_lock(key, token).await {
+                Ok(()) => return Ok(()),
+                Err(error) if self.redis_required => return Err(error),
+                Err(error) => eprintln!(
+                    "Redis lock release failed, falling back to memory: {}",
+                    error
+                ),
+            }
+        } else if self.redis_required {
+            return Err(SecurityStoreError::new(
+                "Redis is required but not available",
+            ));
+        }
+
+        self.memory.release_lock(key, token).await;
+        Ok(())
     }
 
     pub async fn get_access_policy(&self) -> StoreResult<Option<AccessPolicy>> {
@@ -435,21 +478,61 @@ impl RedisSecurityStore {
             .map_err(|error| SecurityStoreError::new(error.to_string()))
     }
 
+    #[allow(dead_code)]
     async fn cache_remove_prefix(&self, prefix: &str) -> StoreResult<()> {
         let pattern = redis_key(&format!("cache:{}*", prefix));
         let mut conn = self.manager.clone();
-        let keys = redis::cmd("KEYS")
-            .arg(pattern)
-            .query_async::<Vec<String>>(&mut conn)
-            .await
-            .map_err(|error| SecurityStoreError::new(error.to_string()))?;
-        if !keys.is_empty() {
-            redis::cmd("DEL")
-                .arg(keys)
-                .query_async::<()>(&mut conn)
+        let mut cursor = 0_u64;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
                 .await
                 .map_err(|error| SecurityStoreError::new(error.to_string()))?;
+            if !keys.is_empty() {
+                redis::cmd("DEL")
+                    .arg(keys)
+                    .query_async::<()>(&mut conn)
+                    .await
+                    .map_err(|error| SecurityStoreError::new(error.to_string()))?;
+            }
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
         }
+        Ok(())
+    }
+
+    async fn acquire_lock(&self, key: &str, token: &str, ttl: Duration) -> StoreResult<bool> {
+        let mut conn = self.manager.clone();
+        let result = redis::cmd("SET")
+            .arg(redis_key(&format!("lock:{}", key)))
+            .arg(token)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl.as_secs().max(1))
+            .query_async::<Option<String>>(&mut conn)
+            .await
+            .map_err(|error| SecurityStoreError::new(error.to_string()))?;
+        Ok(result.is_some())
+    }
+
+    async fn release_lock(&self, key: &str, token: &str) -> StoreResult<()> {
+        let script = redis::Script::new(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+        );
+        let mut conn = self.manager.clone();
+        script
+            .key(redis_key(&format!("lock:{}", key)))
+            .arg(token)
+            .invoke_async::<i32>(&mut conn)
+            .await
+            .map_err(|error| SecurityStoreError::new(error.to_string()))?;
         Ok(())
     }
 
@@ -522,6 +605,7 @@ struct MemorySecurityStore {
     cache_entries: Mutex<HashMap<String, MemoryCacheEntry>>,
     policy: RwLock<Option<MemoryAccessPolicyEntry>>,
     admin_sessions: Mutex<HashMap<String, MemoryAdminSession>>,
+    locks: Mutex<HashMap<String, MemoryLockEntry>>,
 }
 
 impl MemorySecurityStore {
@@ -534,6 +618,7 @@ impl MemorySecurityStore {
             cache_entries: Mutex::new(HashMap::new()),
             policy: RwLock::new(None),
             admin_sessions: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -655,9 +740,37 @@ impl MemorySecurityStore {
         );
     }
 
+    #[allow(dead_code)]
     async fn cache_remove_prefix(&self, prefix: &str) {
         let mut entries = self.cache_entries.lock().await;
         entries.retain(|key, _| !key.starts_with(prefix));
+    }
+
+    async fn acquire_lock(&self, key: &str, token: &str, ttl: Duration) -> bool {
+        let now = Instant::now();
+        let mut locks = self.locks.lock().await;
+        locks.retain(|_, entry| entry.expires_at > now);
+        if locks.contains_key(key) {
+            return false;
+        }
+        locks.insert(
+            key.to_string(),
+            MemoryLockEntry {
+                token: token.to_string(),
+                expires_at: now + ttl,
+            },
+        );
+        true
+    }
+
+    async fn release_lock(&self, key: &str, token: &str) {
+        let mut locks = self.locks.lock().await;
+        if locks
+            .get(key)
+            .is_some_and(|entry| entry.token.as_str() == token)
+        {
+            locks.remove(key);
+        }
     }
 
     async fn get_access_policy(&self) -> Option<AccessPolicy> {
@@ -735,6 +848,12 @@ struct MemoryAccessPolicyEntry {
 #[derive(Debug)]
 struct MemoryAdminSession {
     csrf_token: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct MemoryLockEntry {
+    token: String,
     expires_at: Instant,
 }
 

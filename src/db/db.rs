@@ -1,42 +1,46 @@
 use crate::models::{
     AccessPolicy, ApiKeyRecord, BazaarAggregatedData, BazaarCandle, BazaarData, BazaarLatest,
-    CompressionLog, CompressionState, PaginationInfo,
+    CandleMetric, CompressionLog, CompressionState, PaginationInfo,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures::TryStreamExt;
 use mongodb::Database;
-use mongodb::bson::{DateTime as BsonDateTime, Document, doc, oid::ObjectId};
+use mongodb::bson::{Bson, DateTime as BsonDateTime, Document, doc, oid::ObjectId};
+use mongodb::options::{IndexOptions, UpdateModifications, UpdateOneModel, WriteModel};
+use std::collections::HashMap;
+use std::time::Duration as StdDuration;
+
+pub const BULK_WRITE_CHUNK_SIZE: usize = 750;
 
 // Database initialization ve indexing
 pub async fn ensure_indexes(db: &Database) -> Result<(), Box<dyn std::error::Error>> {
+    require_mongodb_8(db).await?;
+
     // Raw data collection indexes
     let collection = db.collection::<BazaarData>("bazaar");
 
     // Compound index for product_id and timestamp (en önemli sorgu)
     let index_model = mongodb::IndexModel::builder()
         .keys(doc! { "product_id": 1, "timestamp": -1 })
+        .options(
+            IndexOptions::builder()
+                .name("bazaar_product_timestamp".to_string())
+                .build(),
+        )
         .build();
 
-    // Individual indexes
-    let timestamp_index = mongodb::IndexModel::builder()
-        .keys(doc! { "timestamp": -1 })
-        .build();
-
-    let product_index = mongodb::IndexModel::builder()
-        .keys(doc! { "product_id": 1 })
-        .build();
-
-    let price_index = mongodb::IndexModel::builder()
-        .keys(doc! { "buy_price": 1, "sell_price": 1 })
+    let raw_ttl_index = mongodb::IndexModel::builder()
+        .keys(doc! { "expires_at": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("bazaar_expires_at_ttl".to_string())
+                .expire_after(StdDuration::from_secs(0))
+                .build(),
+        )
         .build();
 
     collection
-        .create_indexes(vec![
-            index_model,
-            timestamp_index,
-            product_index,
-            price_index,
-        ])
+        .create_indexes(vec![index_model, raw_ttl_index])
         .await?;
 
     // Latest snapshot collection indexes
@@ -44,7 +48,8 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), Box<dyn std::error::Err
     let latest_product_index = mongodb::IndexModel::builder()
         .keys(doc! { "product_id": 1 })
         .options(
-            mongodb::options::IndexOptions::builder()
+            IndexOptions::builder()
+                .name("bazaar_latest_product_unique".to_string())
                 .unique(true)
                 .build(),
         )
@@ -54,51 +59,57 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), Box<dyn std::error::Err
     // Materialized chart candle indexes
     let candle_collection = db.collection::<BazaarCandle>("bazaar_candles");
     let candle_unique_index = mongodb::IndexModel::builder()
-        .keys(doc! { "product_id": 1, "interval": 1, "metric": 1, "period_start": 1 })
+        .keys(doc! { "product_id": 1, "interval": 1, "period_start": 1 })
         .options(
-            mongodb::options::IndexOptions::builder()
+            IndexOptions::builder()
+                .name("bazaar_candles_product_interval_period_unique".to_string())
                 .unique(true)
                 .build(),
         )
         .build();
-    let candle_query_index = mongodb::IndexModel::builder()
-        .keys(doc! { "product_id": 1, "interval": 1, "metric": 1, "period_start": -1 })
+    let candle_rollup_index = mongodb::IndexModel::builder()
+        .keys(doc! { "interval": 1, "period_start": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("bazaar_candles_interval_period".to_string())
+                .build(),
+        )
+        .build();
+    let candle_ttl_index = mongodb::IndexModel::builder()
+        .keys(doc! { "expires_at": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("bazaar_candles_expires_at_ttl".to_string())
+                .expire_after(StdDuration::from_secs(0))
+                .build(),
+        )
         .build();
     candle_collection
-        .create_indexes(vec![candle_unique_index, candle_query_index])
-        .await?;
-
-    // Aggregated data collection indexes
-    let aggregated_collection = db.collection::<BazaarAggregatedData>("bazaar_aggregated");
-
-    let agg_compound_index = mongodb::IndexModel::builder()
-        .keys(doc! { "product_id": 1, "aggregation_type": 1, "period_start": -1 })
-        .build();
-
-    let agg_period_index = mongodb::IndexModel::builder()
-        .keys(doc! { "period_start": -1, "period_end": -1 })
-        .build();
-
-    let agg_type_index = mongodb::IndexModel::builder()
-        .keys(doc! { "aggregation_type": 1, "interval_minutes": 1 })
-        .build();
-
-    aggregated_collection
-        .create_indexes(vec![agg_compound_index, agg_period_index, agg_type_index])
+        .create_indexes(vec![
+            candle_unique_index,
+            candle_rollup_index,
+            candle_ttl_index,
+        ])
         .await?;
 
     // Compression tracking collection indexes
     let compression_state_collection = db.collection::<CompressionState>("compression_state");
     let cs_product_index = mongodb::IndexModel::builder()
-        .keys(doc! { "product_id": 1 })
+        .keys(doc! { "source_interval": 1, "target_interval": 1 })
         .options(
-            mongodb::options::IndexOptions::builder()
+            IndexOptions::builder()
+                .name("compression_state_rollup_unique".to_string())
                 .unique(true)
                 .build(),
         )
         .build();
     let cs_updated_index = mongodb::IndexModel::builder()
         .keys(doc! { "updated_at": -1 })
+        .options(
+            IndexOptions::builder()
+                .name("compression_state_updated_at".to_string())
+                .build(),
+        )
         .build();
     compression_state_collection
         .create_indexes(vec![cs_product_index, cs_updated_index])
@@ -106,17 +117,16 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), Box<dyn std::error::Err
 
     // Compression log collection indexes
     let compression_log_collection = db.collection::<CompressionLog>("compression_log");
-    let cl_product_index = mongodb::IndexModel::builder()
-        .keys(doc! { "product_id": 1, "created_at": -1 })
-        .build();
     let cl_type_index = mongodb::IndexModel::builder()
         .keys(doc! { "compression_type": 1, "created_at": -1 })
-        .build();
-    let cl_status_index = mongodb::IndexModel::builder()
-        .keys(doc! { "status": 1, "created_at": -1 })
+        .options(
+            IndexOptions::builder()
+                .name("compression_log_type_created_at".to_string())
+                .build(),
+        )
         .build();
     compression_log_collection
-        .create_indexes(vec![cl_product_index, cl_type_index, cl_status_index])
+        .create_index(cl_type_index)
         .await?;
 
     // API key and access policy indexes
@@ -124,13 +134,19 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), Box<dyn std::error::Err
     let api_key_prefix_index = mongodb::IndexModel::builder()
         .keys(doc! { "key_prefix": 1 })
         .options(
-            mongodb::options::IndexOptions::builder()
+            IndexOptions::builder()
+                .name("api_keys_prefix_unique".to_string())
                 .unique(true)
                 .build(),
         )
         .build();
     let api_key_status_index = mongodb::IndexModel::builder()
         .keys(doc! { "status": 1, "created_at": -1 })
+        .options(
+            IndexOptions::builder()
+                .name("api_keys_status_created_at".to_string())
+                .build(),
+        )
         .build();
     api_key_collection
         .create_indexes(vec![api_key_prefix_index, api_key_status_index])
@@ -139,6 +155,11 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), Box<dyn std::error::Err
     let access_policy_collection = db.collection::<AccessPolicy>("api_settings");
     let access_policy_index = mongodb::IndexModel::builder()
         .keys(doc! { "_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("api_settings_id".to_string())
+                .build(),
+        )
         .build();
     access_policy_collection
         .create_index(access_policy_index)
@@ -150,6 +171,21 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+async fn require_mongodb_8(db: &Database) -> Result<(), Box<dyn std::error::Error>> {
+    let build_info = db.run_command(doc! { "buildInfo": 1 }).await?;
+    let version = build_info.get_str("version").unwrap_or("0");
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    if major < 8 {
+        return Err(format!("MongoDB 8.0+ is required for bulkWrite; detected {version}").into());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub async fn insert_bazaar_data(
     db: &Database,
     data: BazaarData,
@@ -159,6 +195,22 @@ pub async fn insert_bazaar_data(
     Ok(())
 }
 
+pub async fn insert_bazaar_data_batch(
+    db: &Database,
+    data: &[BazaarData],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let collection = db.collection::<BazaarData>("bazaar");
+    for chunk in data.chunks(BULK_WRITE_CHUNK_SIZE) {
+        collection.insert_many(chunk).ordered(false).await?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub async fn upsert_latest_bazaar_data(
     db: &Database,
     data: &BazaarData,
@@ -185,6 +237,43 @@ pub async fn upsert_latest_bazaar_data(
         .upsert(true)
         .await?;
     Ok(())
+}
+
+pub async fn upsert_latest_bazaar_data_batch(
+    db: &Database,
+    data: &[BazaarData],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let collection = db.collection::<BazaarLatest>("bazaar_latest");
+    let now = Utc::now();
+    let mut models = Vec::with_capacity(data.len());
+    for item in data {
+        models.push(
+            UpdateOneModel::builder()
+                .namespace(collection.namespace())
+                .filter(doc! { "product_id": &item.product_id })
+                .update(UpdateModifications::from(doc! {
+                    "$set": {
+                        "product_id": &item.product_id,
+                        "buy_price": item.buy_price,
+                        "sell_price": item.sell_price,
+                        "buy_volume": item.buy_volume,
+                        "sell_volume": item.sell_volume,
+                        "buy_orders": item.buy_orders,
+                        "sell_orders": item.sell_orders,
+                        "timestamp": item.timestamp.timestamp_millis(),
+                        "updated_at": bson_datetime(now),
+                    }
+                }))
+                .upsert(true)
+                .build()
+                .into(),
+        );
+    }
+    execute_bulk_write(db, models).await
 }
 
 pub async fn get_latest_bazaar_data_v2(
@@ -260,64 +349,128 @@ pub async fn get_latest_many_v2(
     Ok(results)
 }
 
+#[allow(dead_code)]
 pub async fn upsert_chart_candles(
     db: &Database,
     data: &BazaarData,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let collection = db.collection::<BazaarCandle>("bazaar_candles");
-    let intervals = ["15s", "1m", "5m", "15m", "1h", "1d", "1w", "1mo"];
-    let metrics = [
-        ("buy_price", data.buy_price),
-        ("sell_price", data.sell_price),
-        ("mid_price", (data.buy_price + data.sell_price) / 2.0),
-        ("spread", (data.buy_price - data.sell_price).abs()),
-    ];
-    let volume = data.buy_volume.saturating_add(data.sell_volume);
-    let now = Utc::now();
+    upsert_chart_candles_batch(db, std::slice::from_ref(data)).await
+}
 
-    for interval in intervals {
-        let Some((period_start, period_end)) = candle_period(data.timestamp, interval) else {
-            continue;
-        };
-
-        for (metric, value) in metrics {
-            collection
-                .update_one(
-                    doc! {
-                        "product_id": &data.product_id,
-                        "interval": interval,
-                        "metric": metric,
-                        "period_start": bson_datetime(period_start),
-                    },
-                    doc! {
-                        "$setOnInsert": {
-                            "product_id": &data.product_id,
-                            "interval": interval,
-                            "metric": metric,
-                            "period_start": bson_datetime(period_start),
-                            "period_end": bson_datetime(period_end),
-                            "open": value,
-                        },
-                        "$max": { "high": value },
-                        "$min": { "low": value },
-                        "$set": {
-                            "close": value,
-                            "updated_at": bson_datetime(now),
-                        },
-                        "$inc": {
-                            "value_sum": value,
-                            "volume": volume,
-                            "buy_volume_sum": data.buy_volume,
-                            "sell_volume_sum": data.sell_volume,
-                            "sample_count": 1_i64,
-                        }
-                    },
-                )
-                .upsert(true)
-                .await?;
-        }
+pub async fn upsert_chart_candles_batch(
+    db: &Database,
+    data: &[BazaarData],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if data.is_empty() {
+        return Ok(());
     }
 
+    let collection = db.collection::<BazaarCandle>("bazaar_candles");
+    let now = Utc::now();
+    let mut models = Vec::with_capacity(data.len());
+    for item in data {
+        let Some((period_start, period_end)) = candle_period(item.timestamp, "15s") else {
+            continue;
+        };
+        models.push(candle_update_model(
+            &collection,
+            item,
+            "15s",
+            period_start,
+            period_end,
+            now,
+        ));
+    }
+    execute_bulk_write(db, models).await
+}
+
+fn candle_update_model(
+    collection: &mongodb::Collection<BazaarCandle>,
+    data: &BazaarData,
+    interval: &str,
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> WriteModel {
+    let buy_price = data.buy_price;
+    let sell_price = data.sell_price;
+    let mid_price = (data.buy_price + data.sell_price) / 2.0;
+    let spread = (data.buy_price - data.sell_price).abs();
+    let volume = data.buy_volume.saturating_add(data.sell_volume);
+    let expires_at = retention_expires_at(interval, period_end);
+    let mut set_doc = doc! {
+        "buy_price.close": buy_price,
+        "sell_price.close": sell_price,
+        "mid_price.close": mid_price,
+        "spread.close": spread,
+        "updated_at": bson_datetime(now),
+    };
+    if let Some(expires_at) = expires_at {
+        set_doc.insert("expires_at", bson_datetime(expires_at));
+    }
+
+    UpdateOneModel::builder()
+        .namespace(collection.namespace())
+        .filter(doc! {
+            "product_id": &data.product_id,
+            "interval": interval,
+            "period_start": bson_datetime(period_start),
+        })
+        .update(UpdateModifications::from(doc! {
+            "$setOnInsert": {
+                "product_id": &data.product_id,
+                "interval": interval,
+                "period_start": bson_datetime(period_start),
+                "period_end": bson_datetime(period_end),
+                "buy_price.open": buy_price,
+                "sell_price.open": sell_price,
+                "mid_price.open": mid_price,
+                "spread.open": spread,
+            },
+            "$max": {
+                "buy_price.high": buy_price,
+                "sell_price.high": sell_price,
+                "mid_price.high": mid_price,
+                "spread.high": spread,
+            },
+            "$min": {
+                "buy_price.low": buy_price,
+                "sell_price.low": sell_price,
+                "mid_price.low": mid_price,
+                "spread.low": spread,
+            },
+            "$set": set_doc,
+            "$inc": {
+                "buy_price.value_sum": buy_price,
+                "sell_price.value_sum": sell_price,
+                "mid_price.value_sum": mid_price,
+                "spread.value_sum": spread,
+                "buy_price.sample_count": 1_i64,
+                "sell_price.sample_count": 1_i64,
+                "mid_price.sample_count": 1_i64,
+                "spread.sample_count": 1_i64,
+                "volume": volume,
+                "buy_volume_sum": data.buy_volume,
+                "sell_volume_sum": data.sell_volume,
+            }
+        }))
+        .upsert(true)
+        .build()
+        .into()
+}
+
+async fn execute_bulk_write(
+    db: &Database,
+    models: Vec<WriteModel>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if models.is_empty() {
+        return Ok(());
+    }
+
+    let client = db.client().clone();
+    for chunk in models.chunks(BULK_WRITE_CHUNK_SIZE) {
+        client.bulk_write(chunk.to_vec()).ordered(false).await?;
+    }
     Ok(())
 }
 
@@ -325,7 +478,7 @@ pub async fn get_candles(
     db: &Database,
     product_id: &str,
     interval: &str,
-    metric: &str,
+    _metric: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     limit: u32,
@@ -335,7 +488,6 @@ pub async fn get_candles(
         .find(doc! {
             "product_id": product_id,
             "interval": interval,
-            "metric": metric,
             "period_start": {
                 "$gte": bson_datetime(start),
                 "$lte": bson_datetime(end),
@@ -351,33 +503,230 @@ pub async fn get_candles(
     Ok(candles)
 }
 
-pub async fn cleanup_retention(db: &Database) -> Result<(), Box<dyn std::error::Error>> {
-    let raw_collection = db.collection::<BazaarData>("bazaar");
-    let now = Utc::now();
-    raw_collection
-        .delete_many(doc! {
-            "timestamp": { "$lt": (now - Duration::hours(24)).timestamp_millis() }
-        })
-        .await?;
-
-    let candle_collection = db.collection::<BazaarCandle>("bazaar_candles");
-    let retention_rules = [
-        ("15s", Duration::hours(24)),
-        ("1m", Duration::days(30)),
-        ("5m", Duration::days(180)),
-        ("15m", Duration::days(180)),
-        ("1h", Duration::days(365 * 5)),
+pub async fn rollup_closed_candles(db: &Database) -> Result<usize, Box<dyn std::error::Error>> {
+    let specs = [
+        ("15s", "1m"),
+        ("1m", "5m"),
+        ("5m", "15m"),
+        ("15m", "1h"),
+        ("1h", "1d"),
+        ("1d", "1w"),
+        ("1d", "1mo"),
     ];
+    let mut total_written = 0usize;
+    for (source_interval, target_interval) in specs {
+        total_written += rollup_spec(db, source_interval, target_interval).await?;
+    }
+    Ok(total_written)
+}
 
-    for (interval, retention) in retention_rules {
-        candle_collection
-            .delete_many(doc! {
-                "interval": interval,
-                "period_end": { "$lt": bson_datetime(now - retention) },
-            })
-            .await?;
+async fn rollup_spec(
+    db: &Database,
+    source_interval: &str,
+    target_interval: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let Some(target_seconds) = interval_seconds(target_interval) else {
+        return Ok(0);
+    };
+    let Some(current_target_start) = candle_period(Utc::now(), target_interval).map(|(s, _)| s)
+    else {
+        return Ok(0);
+    };
+
+    let state = get_rollup_state(db, source_interval, target_interval).await?;
+    let mut next_start =
+        if let Some(last_processed) = state.and_then(|state| state.last_processed_period_start) {
+            last_processed + Duration::seconds(target_seconds)
+        } else if let Some(oldest) = oldest_source_period(db, source_interval).await? {
+            candle_period(oldest, target_interval)
+                .map(|(start, _)| start)
+                .unwrap_or(oldest)
+        } else {
+            return Ok(0);
+        };
+
+    let started_at = std::time::Instant::now();
+    let mut first_processed = None;
+    let mut last_processed = None;
+    let mut source_records_count = 0_i64;
+    let mut compressed_records_count = 0_i64;
+    let mut written = 0usize;
+
+    for _ in 0..240 {
+        if next_start >= current_target_start {
+            break;
+        }
+        let period_end = next_start + Duration::seconds(target_seconds);
+        let source_rows = load_source_candles(db, source_interval, next_start, period_end).await?;
+        source_records_count += source_rows.len() as i64;
+        let rollups = build_rollup_candles(&source_rows, target_interval, next_start, period_end);
+        compressed_records_count += rollups.len() as i64;
+        upsert_rollup_candles(db, &rollups).await?;
+        written += rollups.len();
+        upsert_rollup_state(
+            db,
+            source_interval,
+            target_interval,
+            Some(next_start),
+            false,
+        )
+        .await?;
+        first_processed.get_or_insert(next_start);
+        last_processed = Some(next_start);
+        next_start = period_end;
     }
 
+    if let (Some(first), Some(last)) = (first_processed, last_processed) {
+        let log = CompressionLog {
+            id: None,
+            product_id: "*".to_string(),
+            compression_type: format!("{source_interval}_to_{target_interval}"),
+            source_period_start: first,
+            source_period_end: last + Duration::seconds(target_seconds),
+            compressed_period_start: first,
+            compressed_period_end: last + Duration::seconds(target_seconds),
+            source_records_count,
+            compressed_records_count,
+            bytes_saved: None,
+            compression_duration_ms: started_at.elapsed().as_millis() as i64,
+            status: "success".to_string(),
+            error_message: None,
+            created_at: Utc::now(),
+        };
+        log_compression(db, &log).await?;
+    }
+
+    Ok(written)
+}
+
+async fn oldest_source_period(
+    db: &Database,
+    source_interval: &str,
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    let collection = db.collection::<BazaarCandle>("bazaar_candles");
+    Ok(collection
+        .find_one(doc! { "interval": source_interval })
+        .sort(doc! { "period_start": 1 })
+        .await?
+        .map(|candle| candle.period_start))
+}
+
+async fn load_source_candles(
+    db: &Database,
+    source_interval: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<BazaarCandle>, Box<dyn std::error::Error>> {
+    let collection = db.collection::<BazaarCandle>("bazaar_candles");
+    let mut cursor = collection
+        .find(doc! {
+            "interval": source_interval,
+            "period_start": {
+                "$gte": bson_datetime(start),
+                "$lt": bson_datetime(end),
+            }
+        })
+        .sort(doc! { "period_start": 1, "product_id": 1 })
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.try_next().await? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn build_rollup_candles(
+    source_rows: &[BazaarCandle],
+    target_interval: &str,
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+) -> Vec<BazaarCandle> {
+    let mut by_product: HashMap<String, BazaarCandle> = HashMap::new();
+    let now = Utc::now();
+    for row in source_rows {
+        by_product
+            .entry(row.product_id.clone())
+            .and_modify(|target| merge_candle(target, row))
+            .or_insert_with(|| BazaarCandle {
+                product_id: row.product_id.clone(),
+                interval: target_interval.to_string(),
+                period_start,
+                period_end,
+                buy_price: row.buy_price.clone(),
+                sell_price: row.sell_price.clone(),
+                mid_price: row.mid_price.clone(),
+                spread: row.spread.clone(),
+                volume: row.volume,
+                buy_volume_sum: row.buy_volume_sum,
+                sell_volume_sum: row.sell_volume_sum,
+                updated_at: now,
+                expires_at: retention_expires_at(target_interval, period_end),
+            });
+    }
+    by_product.into_values().collect()
+}
+
+fn merge_candle(target: &mut BazaarCandle, source: &BazaarCandle) {
+    merge_metric(&mut target.buy_price, &source.buy_price);
+    merge_metric(&mut target.sell_price, &source.sell_price);
+    merge_metric(&mut target.mid_price, &source.mid_price);
+    merge_metric(&mut target.spread, &source.spread);
+    target.volume = target.volume.saturating_add(source.volume);
+    target.buy_volume_sum = target.buy_volume_sum.saturating_add(source.buy_volume_sum);
+    target.sell_volume_sum = target
+        .sell_volume_sum
+        .saturating_add(source.sell_volume_sum);
+    target.updated_at = Utc::now();
+}
+
+fn merge_metric(target: &mut CandleMetric, source: &CandleMetric) {
+    target.high = target.high.max(source.high);
+    target.low = target.low.min(source.low);
+    target.close = source.close;
+    target.value_sum += source.value_sum;
+    target.sample_count += source.sample_count;
+}
+
+async fn upsert_rollup_candles(
+    db: &Database,
+    candles: &[BazaarCandle],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if candles.is_empty() {
+        return Ok(());
+    }
+
+    let collection = db.collection::<BazaarCandle>("bazaar_candles");
+    let mut models = Vec::with_capacity(candles.len());
+    for candle in candles {
+        let set_doc = mongodb::bson::to_document(candle)?;
+        let update = if candle.expires_at.is_some() {
+            doc! { "$set": set_doc }
+        } else {
+            doc! {
+                "$set": set_doc,
+                "$unset": { "expires_at": "" },
+            }
+        };
+        models.push(
+            UpdateOneModel::builder()
+                .namespace(collection.namespace())
+                .filter(doc! {
+                    "product_id": &candle.product_id,
+                    "interval": &candle.interval,
+                    "period_start": bson_datetime(candle.period_start),
+                })
+                .update(UpdateModifications::from(update))
+                .upsert(true)
+                .build()
+                .into(),
+        );
+    }
+    execute_bulk_write(db, models).await
+}
+
+#[allow(dead_code)]
+pub async fn cleanup_retention(db: &Database) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = db;
     Ok(())
 }
 
@@ -839,44 +1188,53 @@ pub async fn get_bazaar_data_by_timeframe(
 
 // === COMPRESSION TRACKING FUNCTIONS ===
 
-// Compression state management
-#[allow(dead_code)]
-pub async fn get_compression_state(
+async fn get_rollup_state(
     db: &Database,
-    product_id: &str,
+    source_interval: &str,
+    target_interval: &str,
 ) -> Result<Option<CompressionState>, Box<dyn std::error::Error>> {
     let collection = db.collection::<CompressionState>("compression_state");
-    let state = collection
-        .find_one(doc! { "product_id": product_id })
-        .await?;
-    Ok(state)
+    Ok(collection
+        .find_one(doc! { "_id": rollup_state_id(source_interval, target_interval) })
+        .await?)
 }
 
-#[allow(dead_code)]
-pub async fn upsert_compression_state(
+async fn upsert_rollup_state(
     db: &Database,
-    state: &CompressionState,
+    source_interval: &str,
+    target_interval: &str,
+    last_processed_period_start: Option<DateTime<Utc>>,
+    compression_in_progress: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let collection = db.collection::<CompressionState>("compression_state");
-    let filter = doc! { "product_id": &state.product_id };
-    let update = doc! {
-        "$set": {
-            "product_id": &state.product_id,
-            "last_minutely_compression": state.last_minutely_compression.timestamp_millis(),
-            "last_hourly_compression": state.last_hourly_compression.timestamp_millis(),
-            "last_daily_compression": state.last_daily_compression.timestamp_millis(),
-            "last_weekly_compression": state.last_weekly_compression.timestamp_millis(),
-            "compression_in_progress": state.compression_in_progress,
-            "current_operation": &state.current_operation,
-            "updated_at": Utc::now().timestamp_millis()
-        },
-        "$setOnInsert": {
-            "created_at": Utc::now().timestamp_millis()
-        }
+    let now = Utc::now();
+    let mut set_doc = doc! {
+        "source_interval": source_interval,
+        "target_interval": target_interval,
+        "compression_in_progress": compression_in_progress,
+        "current_operation": Bson::Null,
+        "updated_at": bson_datetime(now),
     };
-
-    collection.update_one(filter, update).upsert(true).await?;
+    if let Some(last_processed) = last_processed_period_start {
+        set_doc.insert("last_processed_period_start", bson_datetime(last_processed));
+    }
+    collection
+        .update_one(
+            doc! { "_id": rollup_state_id(source_interval, target_interval) },
+            doc! {
+                "$set": set_doc,
+                "$setOnInsert": {
+                    "created_at": bson_datetime(now),
+                }
+            },
+        )
+        .upsert(true)
+        .await?;
     Ok(())
+}
+
+fn rollup_state_id(source_interval: &str, target_interval: &str) -> String {
+    format!("{source_interval}_to_{target_interval}")
 }
 
 // Compression logging
@@ -918,31 +1276,6 @@ pub async fn get_compression_logs(
     }
 
     Ok(logs)
-}
-
-// Check if data needs compression based on last compression timestamp
-#[allow(dead_code)]
-pub async fn needs_compression(
-    db: &Database,
-    product_id: &str,
-    compression_type: &str,
-    cutoff_time: DateTime<Utc>,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if let Some(state) = get_compression_state(db, product_id).await? {
-        let last_compression = match compression_type {
-            "minutely_to_hourly" => state.last_minutely_compression,
-            "hourly_to_daily" => state.last_hourly_compression,
-            "daily_to_weekly" => state.last_daily_compression,
-            "weekly_to_monthly" => state.last_weekly_compression,
-            _ => return Ok(true), // Unknown type, assume needs compression
-        };
-
-        // If last compression is before cutoff time, we need compression
-        Ok(last_compression < cutoff_time)
-    } else {
-        // No compression state found, needs compression
-        Ok(true)
-    }
 }
 
 // Get compression statistics
@@ -1015,6 +1348,21 @@ pub async fn get_compression_stats(db: &Database) -> Result<Document, Box<dyn st
 
 fn bson_datetime(value: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(value.timestamp_millis())
+}
+
+pub fn raw_expires_at(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    timestamp + Duration::hours(24)
+}
+
+pub fn retention_expires_at(interval: &str, period_end: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match interval {
+        "15s" => Some(period_end + Duration::hours(24)),
+        "1m" => Some(period_end + Duration::days(30)),
+        "5m" | "15m" => Some(period_end + Duration::days(180)),
+        "1h" => Some(period_end + Duration::days(365 * 5)),
+        "1d" | "1w" | "1mo" => None,
+        _ => Some(period_end + Duration::hours(24)),
+    }
 }
 
 pub fn interval_seconds(interval: &str) -> Option<i64> {

@@ -13,6 +13,12 @@ pub struct BazaarData {
     pub sell_orders: i64,
     #[serde(with = "chrono::serde::ts_milliseconds")]
     pub timestamp: DateTime<Utc>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "bson::serde_helpers::chrono_datetime_as_bson_datetime_optional"
+    )]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -126,25 +132,38 @@ pub struct FilterQuery {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BazaarCandle {
-    pub product_id: String,
-    pub interval: String,
-    pub metric: String,
-    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
-    pub period_start: DateTime<Utc>,
-    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
-    pub period_end: DateTime<Utc>,
+pub struct CandleMetric {
     pub open: f64,
     pub high: f64,
     pub low: f64,
     pub close: f64,
     pub value_sum: f64,
+    pub sample_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BazaarCandle {
+    pub product_id: String,
+    pub interval: String,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
+    pub period_start: DateTime<Utc>,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
+    pub period_end: DateTime<Utc>,
+    pub buy_price: CandleMetric,
+    pub sell_price: CandleMetric,
+    pub mid_price: CandleMetric,
+    pub spread: CandleMetric,
     pub volume: i64,
     pub buy_volume_sum: i64,
     pub sell_volume_sum: i64,
-    pub sample_count: i64,
     #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub updated_at: DateTime<Utc>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "bson::serde_helpers::chrono_datetime_as_bson_datetime_optional"
+    )]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -336,26 +355,38 @@ impl Default for DataLifecycleConfig {
 // Compression state tracking per product
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CompressionState {
-    pub product_id: String,
-    pub last_minutely_compression: DateTime<Utc>,
-    pub last_hourly_compression: DateTime<Utc>,
-    pub last_daily_compression: DateTime<Utc>,
-    pub last_weekly_compression: DateTime<Utc>,
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub source_interval: String,
+    pub target_interval: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "bson::serde_helpers::chrono_datetime_as_bson_datetime_optional"
+    )]
+    pub last_processed_period_start: Option<DateTime<Utc>>,
     pub compression_in_progress: bool,
     pub current_operation: Option<String>,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub created_at: DateTime<Utc>,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub updated_at: DateTime<Utc>,
 }
 
 // Compression log entry for detailed tracking
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CompressionLog {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<mongodb::bson::oid::ObjectId>,
     pub product_id: String,
     pub compression_type: String, // "minutely_to_hourly", "hourly_to_daily", etc.
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub source_period_start: DateTime<Utc>,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub source_period_end: DateTime<Utc>,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub compressed_period_start: DateTime<Utc>,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub compressed_period_end: DateTime<Utc>,
     pub source_records_count: i64,
     pub compressed_records_count: i64,
@@ -363,6 +394,7 @@ pub struct CompressionLog {
     pub compression_duration_ms: i64,
     pub status: String, // "success", "failed", "partial"
     pub error_message: Option<String>,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub created_at: DateTime<Utc>,
 }
 

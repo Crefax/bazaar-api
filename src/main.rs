@@ -22,9 +22,9 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to create MongoDB client");
     let db = client.database(&config.mongodb_db);
 
-    if let Err(e) = db::ensure_indexes(&db).await {
-        eprintln!("Warning: Failed to create indexes: {}", e);
-    }
+    db::ensure_indexes(&db)
+        .await
+        .expect("Failed to create required MongoDB indexes");
 
     let state = state::AppState::new(db, config.clone()).await;
 
@@ -33,9 +33,9 @@ async fn main() -> std::io::Result<()> {
         tracker::start_tracker(tracker_state).await;
     });
 
-    let retention_state = state.clone();
+    let rollup_state = state.clone();
     tokio::spawn(async move {
-        tracker::start_retention_scheduler(retention_state).await;
+        tracker::start_rollup_scheduler(rollup_state).await;
     });
 
     let bind_addr = config.bind_addr.clone();
