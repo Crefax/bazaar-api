@@ -53,6 +53,29 @@ $env:ADMIN_COOKIE_SECURE="true"
 cargo run
 ```
 
+Optimized release build:
+
+```powershell
+cargo build --release
+.\target\release\bazaar-api.exe
+```
+
+Linux/macOS:
+
+```bash
+cargo build --release
+./target/release/bazaar-api
+```
+
+The checked-in release profile uses `opt-level=3`, Thin LTO, one codegen unit, and symbol stripping. `simd-json` keeps runtime detection enabled, so portable release binaries select AVX2/SSE4.2 on x86 and NEON on aarch64 when available.
+
+Optional native-only build for a binary that will run on the same CPU family it was built on:
+
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo build --release
+```
+
 Environment variables:
 
 | Variable | Default | Description |
