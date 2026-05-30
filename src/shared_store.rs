@@ -2,6 +2,7 @@ use crate::config::AppConfig;
 use crate::models::AccessPolicy;
 use chrono::{DateTime, Days, Utc};
 use redis::aio::ConnectionManager;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
@@ -462,7 +463,7 @@ impl RedisSecurityStore {
             .query_async::<Option<String>>(&mut conn)
             .await
             .map_err(|error| SecurityStoreError::new(error.to_string()))?;
-        Ok(raw.and_then(|value| serde_json::from_str(&value).ok()))
+        Ok(raw.and_then(parse_json))
     }
 
     async fn cache_set(&self, key: &str, value: &Value, ttl: Duration) -> StoreResult<()> {
@@ -543,7 +544,7 @@ impl RedisSecurityStore {
             .query_async::<Option<String>>(&mut conn)
             .await
             .map_err(|error| SecurityStoreError::new(error.to_string()))?;
-        Ok(raw.and_then(|value| serde_json::from_str(&value).ok()))
+        Ok(raw.and_then(parse_json))
     }
 
     async fn set_access_policy(&self, policy: &AccessPolicy, ttl: Duration) -> StoreResult<()> {
@@ -894,6 +895,11 @@ fn next_utc_midnight(now: DateTime<Utc>) -> DateTime<Utc> {
 
 fn seconds_until(target: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
     (target - now).num_seconds().max(1) as u64
+}
+
+fn parse_json<T: DeserializeOwned>(raw: String) -> Option<T> {
+    let mut bytes = raw.into_bytes();
+    simd_json::serde::from_slice(&mut bytes).ok()
 }
 
 #[cfg(test)]

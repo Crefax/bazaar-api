@@ -88,8 +88,8 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
 
-    let body = response.bytes().await?;
-    let parsed: HypixelBazaarResponse = serde_json::from_slice(&body)?;
+    let mut body = response.bytes().await?.to_vec();
+    let parsed = parse_hypixel_response(&mut body)?;
     if !parsed.success {
         return Ok(());
     }
@@ -223,9 +223,13 @@ struct HypixelQuickStatus {
     sell_orders: i64,
 }
 
+fn parse_hypixel_response(body: &mut [u8]) -> Result<HypixelBazaarResponse, simd_json::Error> {
+    simd_json::serde::from_slice(body)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::HypixelBazaarResponse;
+    use super::parse_hypixel_response;
     use crate::config::AppConfig;
     use crate::state::{AppState, ProductSnapshot};
     use mongodb::Client;
@@ -272,7 +276,7 @@ mod tests {
 
     #[test]
     fn hypixel_typed_parse_reads_only_quick_status() {
-        let raw = r#"{
+        let mut raw = br#"{
             "success": true,
             "lastUpdated": 123,
             "products": {
@@ -289,8 +293,9 @@ mod tests {
                     }
                 }
             }
-        }"#;
-        let parsed: HypixelBazaarResponse = serde_json::from_str(raw).unwrap();
+        }"#
+        .to_vec();
+        let parsed = parse_hypixel_response(&mut raw).unwrap();
         let quick = parsed.products["WHEAT"].quick_status.as_ref().unwrap();
 
         assert!(parsed.success);
