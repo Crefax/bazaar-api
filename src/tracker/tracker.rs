@@ -88,7 +88,8 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
 
-    let parsed = response.json::<HypixelBazaarResponse>().await?;
+    let body = response.bytes().await?;
+    let parsed: HypixelBazaarResponse = serde_json::from_slice(&body)?;
     if !parsed.success {
         return Ok(());
     }
@@ -106,22 +107,42 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
         *state.hypixel_last_modified.write().await = Some(last_modified);
     }
 
+    let snapshots: Vec<_> = parsed
+        .products
+        .into_iter()
+        .filter_map(|(product_id, product_data)| {
+            let quick_status = product_data.quick_status?;
+            Some((
+                product_id,
+                ProductSnapshot {
+                    buy_price: quick_status.buy_price,
+                    sell_price: quick_status.sell_price,
+                    buy_volume: quick_status.buy_volume,
+                    sell_volume: quick_status.sell_volume,
+                    buy_orders: quick_status.buy_orders,
+                    sell_orders: quick_status.sell_orders,
+                },
+            ))
+        })
+        .collect();
+
+    let candidates: Vec<_> = {
+        let last_snapshot = state.last_snapshot.read().await;
+        snapshots
+            .into_iter()
+            .filter(|(product_id, snapshot)| {
+                !last_snapshot
+                    .get(product_id)
+                    .is_some_and(|previous| previous == snapshot)
+            })
+            .collect()
+    };
+
     let timestamp = chrono::Utc::now();
-    let mut changed = Vec::new();
+    let mut changed = Vec::with_capacity(candidates.len());
     {
         let mut last_snapshot = state.last_snapshot.write().await;
-        for (product_id, product_data) in parsed.products {
-            let Some(quick_status) = product_data.quick_status else {
-                continue;
-            };
-            let snapshot = ProductSnapshot {
-                buy_price: quick_status.buy_price,
-                sell_price: quick_status.sell_price,
-                buy_volume: quick_status.buy_volume,
-                sell_volume: quick_status.sell_volume,
-                buy_orders: quick_status.buy_orders,
-                sell_orders: quick_status.sell_orders,
-            };
+        for (product_id, snapshot) in candidates {
             if last_snapshot
                 .get(&product_id)
                 .is_some_and(|previous| previous == &snapshot)
@@ -147,9 +168,24 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    db::insert_bazaar_data_batch(&state.db, &changed).await?;
-    db::upsert_latest_bazaar_data_batch(&state.db, &changed).await?;
-    db::upsert_chart_candles_batch(&state.db, &changed).await?;
+    tokio::try_join!(
+        async {
+            db::insert_bazaar_data_batch(&state.db, &changed)
+                .await
+                .map_err(|err| err.to_string())
+        },
+        async {
+            db::upsert_latest_bazaar_data_batch(&state.db, &changed)
+                .await
+                .map_err(|err| err.to_string())
+        },
+        async {
+            db::upsert_chart_candles_batch(&state.db, &changed)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    )
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     println!("Tracker stored {} changed products", changed.len());
 
     Ok(())

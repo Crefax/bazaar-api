@@ -551,6 +551,7 @@ async fn rollup_spec(
     let mut source_records_count = 0_i64;
     let mut compressed_records_count = 0_i64;
     let mut written = 0usize;
+    let mut rollup_buffer = Vec::new();
 
     for _ in 0..240 {
         if next_start >= current_target_start {
@@ -561,22 +562,23 @@ async fn rollup_spec(
         source_records_count += source_rows.len() as i64;
         let rollups = build_rollup_candles(&source_rows, target_interval, next_start, period_end);
         compressed_records_count += rollups.len() as i64;
-        upsert_rollup_candles(db, &rollups).await?;
         written += rollups.len();
-        upsert_rollup_state(
-            db,
-            source_interval,
-            target_interval,
-            Some(next_start),
-            false,
-        )
-        .await?;
+        rollup_buffer.extend(rollups);
+        if rollup_buffer.len() >= BULK_WRITE_CHUNK_SIZE {
+            upsert_rollup_candles(db, &rollup_buffer).await?;
+            rollup_buffer.clear();
+        }
         first_processed.get_or_insert(next_start);
         last_processed = Some(next_start);
         next_start = period_end;
     }
 
     if let (Some(first), Some(last)) = (first_processed, last_processed) {
+        if !rollup_buffer.is_empty() {
+            upsert_rollup_candles(db, &rollup_buffer).await?;
+        }
+        upsert_rollup_state(db, source_interval, target_interval, Some(last), false).await?;
+
         let log = CompressionLog {
             id: None,
             product_id: "*".to_string(),
