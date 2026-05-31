@@ -19,6 +19,8 @@ pub struct AppConfig {
     pub cache_max_entries: usize,
     pub rate_limit_max_keys: usize,
     pub admin_json_limit_bytes: usize,
+    pub request_logging: bool,
+    pub response_compression: bool,
 }
 
 impl AppConfig {
@@ -79,6 +81,14 @@ impl AppConfig {
             cache_max_entries: parse_usize_env("CACHE_MAX_ENTRIES", 10_000),
             rate_limit_max_keys: parse_usize_env("RATE_LIMIT_MAX_KEYS", 50_000),
             admin_json_limit_bytes: parse_usize_env("ADMIN_JSON_LIMIT_BYTES", 16 * 1024),
+            request_logging: env::var("REQUEST_LOGGING")
+                .ok()
+                .map(|value| truthy(&value))
+                .unwrap_or_else(|| !app_env.is_production()),
+            response_compression: env::var("RESPONSE_COMPRESSION")
+                .ok()
+                .map(|value| truthy(&value))
+                .unwrap_or_else(|| !app_env.is_production()),
         })
     }
 

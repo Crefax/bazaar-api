@@ -1,9 +1,11 @@
 use crate::config::AppConfig;
+use crate::models::BazaarLatest;
 use crate::shared_store::SharedSecurityStore;
 use mongodb::Database;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Instant;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProductSnapshot {
@@ -22,6 +24,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub security_store: SharedSecurityStore,
     pub last_snapshot: Arc<RwLock<HashMap<String, ProductSnapshot>>>,
+    pub latest_cache: Arc<RwLock<HashMap<String, BazaarLatest>>>,
+    pub api_key_last_used_timestamps: Arc<Mutex<HashMap<String, Instant>>>,
     pub hypixel_last_modified: Arc<RwLock<Option<String>>>,
     pub hypixel_last_updated: Arc<RwLock<Option<i64>>>,
 }
@@ -46,6 +50,8 @@ impl AppState {
             http_client,
             security_store,
             last_snapshot: Arc::new(RwLock::new(HashMap::new())),
+            latest_cache: Arc::new(RwLock::new(HashMap::new())),
+            api_key_last_used_timestamps: Arc::new(Mutex::new(HashMap::new())),
             hypixel_last_modified: Arc::new(RwLock::new(None)),
             hypixel_last_updated: Arc::new(RwLock::new(None)),
         }

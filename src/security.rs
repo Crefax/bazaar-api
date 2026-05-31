@@ -9,8 +9,9 @@ use actix_web::{HttpRequest, HttpResponse};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -254,7 +255,7 @@ pub async fn authorize_public(
             None
         };
 
-        touch_api_key_last_used_throttled(state, &id).await;
+        schedule_api_key_last_used_touch(state, &id).await;
         return Ok(RequestAuth {
             rate_limit,
             daily_quota,
@@ -371,21 +372,40 @@ async fn cached_api_key_record(state: &AppState, cache_key: &str) -> Option<ApiK
     }
 }
 
-async fn touch_api_key_last_used_throttled(state: &AppState, id: &str) {
-    let lock_key = format!("api-key-last-used:{}", id);
-    match state
-        .security_store
-        .acquire_lock(&lock_key, API_KEY_LAST_USED_TOUCH_TTL)
-        .await
-    {
-        Ok(Some(_token)) => {
-            if let Err(error) = db::touch_api_key_last_used(&state.db, id).await {
-                eprintln!("API key last_used_at update failed for {}: {}", id, error);
-            }
-        }
-        Ok(None) => {}
-        Err(error) => eprintln!("API key last_used_at throttle failed: {}", error),
+async fn schedule_api_key_last_used_touch(state: &AppState, id: &str) {
+    let now = Instant::now();
+    let mut timestamps = state.api_key_last_used_timestamps.lock().await;
+    if !should_touch_api_key_last_used(&mut timestamps, id, now) {
+        return;
     }
+    drop(timestamps);
+
+    let db = state.db.clone();
+    let id = id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = db::touch_api_key_last_used(&db, &id).await {
+            eprintln!("API key last_used_at update failed for {}: {}", id, error);
+        }
+    });
+}
+
+fn should_touch_api_key_last_used(
+    timestamps: &mut HashMap<String, Instant>,
+    id: &str,
+    now: Instant,
+) -> bool {
+    let retention = Duration::from_secs(API_KEY_LAST_USED_TOUCH_TTL.as_secs().saturating_mul(10));
+    timestamps.retain(|_, last_touch| now.duration_since(*last_touch) <= retention);
+
+    if timestamps
+        .get(id)
+        .is_some_and(|last_touch| now.duration_since(*last_touch) < API_KEY_LAST_USED_TOUCH_TTL)
+    {
+        return false;
+    }
+
+    timestamps.insert(id.to_string(), now);
+    true
 }
 
 pub fn api_key_record_cache_key(prefix: &str) -> String {
@@ -725,10 +745,12 @@ fn stable_hash(value: &str) -> String {
 mod tests {
     use super::{
         ApiKeyHashStatus, constant_time_eq, generate_user_api_key, legacy_hash_api_key,
-        parse_api_key_prefix, verify_api_key_hash,
+        parse_api_key_prefix, should_touch_api_key_last_used, verify_api_key_hash,
     };
     use crate::config::{AppConfig, AppEnvironment};
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn test_config() -> Arc<AppConfig> {
         Arc::new(AppConfig {
@@ -747,6 +769,8 @@ mod tests {
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
             admin_json_limit_bytes: 16 * 1024,
+            request_logging: false,
+            response_compression: false,
         })
     }
 
@@ -784,5 +808,27 @@ mod tests {
     fn constant_time_comparison_works() {
         assert!(constant_time_eq("same", "same"));
         assert!(!constant_time_eq("same", "nope"));
+    }
+
+    #[test]
+    fn last_used_touch_is_locally_throttled() {
+        let mut timestamps = HashMap::new();
+        let now = Instant::now();
+
+        assert!(should_touch_api_key_last_used(
+            &mut timestamps,
+            "key-id",
+            now
+        ));
+        assert!(!should_touch_api_key_last_used(
+            &mut timestamps,
+            "key-id",
+            now + Duration::from_secs(30)
+        ));
+        assert!(should_touch_api_key_last_used(
+            &mut timestamps,
+            "key-id",
+            now + Duration::from_secs(60)
+        ));
     }
 }

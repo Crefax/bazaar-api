@@ -19,13 +19,15 @@ async fn main() -> std::io::Result<()> {
     load_dotenv();
     let config = config::AppConfig::from_env();
     println!(
-        "Runtime config: app_env={:?}, bind_addr={}, mongodb_db={}, admin_api_key_configured={}, redis_url_configured={}, redis_required={}",
+        "Runtime config: app_env={:?}, bind_addr={}, mongodb_db={}, admin_api_key_configured={}, redis_url_configured={}, redis_required={}, request_logging={}, response_compression={}",
         config.app_env,
         config.bind_addr,
         config.mongodb_db,
         config.admin_api_key.is_some(),
         config.redis_url.is_some(),
-        config.redis_required()
+        config.redis_required(),
+        config.request_logging,
+        config.response_compression
     );
 
     let client = Client::with_uri_str(&config.mongodb_uri)
@@ -73,8 +75,14 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(state.clone()))
             .app_data(web::JsonConfig::default().limit(state.config.admin_json_limit_bytes))
-            .wrap(middleware::Compress::default())
-            .wrap(middleware::Logger::default())
+            .wrap(middleware::Condition::new(
+                state.config.response_compression,
+                middleware::Compress::default(),
+            ))
+            .wrap(middleware::Condition::new(
+                state.config.request_logging,
+                middleware::Logger::default(),
+            ))
             .wrap(middleware::NormalizePath::trim())
             .wrap(default_headers)
             .service(api::admin_panel)
@@ -177,6 +185,8 @@ mod tests {
             cache_max_entries: 100,
             rate_limit_max_keys: 100,
             admin_json_limit_bytes: 16 * 1024,
+            request_logging: false,
+            response_compression: false,
         })
     }
 

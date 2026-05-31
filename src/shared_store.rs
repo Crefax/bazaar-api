@@ -11,6 +11,31 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 const REDIS_KEY_PREFIX: &str = "bazaar-api:";
+const TYPED_L1_CACHE_TTL: Duration = Duration::from_secs(2);
+const RAW_L1_FRESH_TTL: Duration = Duration::from_secs(1);
+const RAW_L1_STALE_TTL: Duration = Duration::from_secs(30);
+const LUA_RATE_LIMITER: &str = r#"
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local current = redis.call('INCR', key)
+if current == 1 then
+    redis.call('EXPIRE', key, window)
+end
+local ttl = redis.call('TTL', key)
+if ttl < 0 then
+    ttl = window
+end
+return {current, ttl}
+"#;
+const LUA_DAILY_QUOTA: &str = r#"
+local key = KEYS[1]
+local ttl = tonumber(ARGV[1])
+local current = redis.call('INCR', key)
+if current == 1 then
+    redis.call('EXPIRE', key, ttl)
+end
+return current
+"#;
 
 #[derive(Debug, Clone)]
 pub struct RateLimitOutcome {
@@ -40,6 +65,24 @@ pub struct StoreReadiness {
     pub redis_required: bool,
     pub redis_available: bool,
     pub ready: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawCacheHit {
+    pub value: String,
+    pub state: RawCacheState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawCacheState {
+    Fresh,
+    Stale,
+}
+
+impl RawCacheHit {
+    pub fn is_stale(&self) -> bool {
+        self.state == RawCacheState::Stale
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,9 +223,19 @@ impl SharedSecurityStore {
     }
 
     pub async fn cache_get(&self, key: &str) -> Option<Value> {
+        if let Some(value) = self.memory.cache_get(key).await {
+            return Some(value);
+        }
+
         if let Some(redis) = &self.redis {
             match redis.cache_get(key).await {
-                Ok(value) => return value,
+                Ok(Some(value)) => {
+                    self.memory
+                        .cache_set(key.to_string(), value.clone(), TYPED_L1_CACHE_TTL)
+                        .await;
+                    return Some(value);
+                }
+                Ok(None) => return None,
                 Err(error) if self.redis_required => {
                     eprintln!("Redis cache get failed while required: {}", error);
                     return None;
@@ -200,7 +253,10 @@ impl SharedSecurityStore {
         let key = key.into();
         if let Some(redis) = &self.redis {
             match redis.cache_set(&key, &value, ttl).await {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.memory.cache_set(key, value, TYPED_L1_CACHE_TTL).await;
+                    return;
+                }
                 Err(error) if self.redis_required => {
                     eprintln!("Redis cache set failed while required: {}", error);
                     return;
@@ -214,14 +270,71 @@ impl SharedSecurityStore {
         self.memory.cache_set(key, value, ttl).await;
     }
 
+    pub async fn raw_cache_get(&self, key: &str) -> Option<RawCacheHit> {
+        if let Some(hit) = self.memory.raw_cache_get(key).await {
+            return Some(hit);
+        }
+
+        if let Some(value) = self.raw_cache_get_l2(key).await {
+            self.memory
+                .raw_cache_set(
+                    key.to_string(),
+                    value.clone(),
+                    RAW_L1_FRESH_TTL,
+                    RAW_L1_STALE_TTL,
+                )
+                .await;
+            return Some(RawCacheHit {
+                value,
+                state: RawCacheState::Fresh,
+            });
+        }
+
+        None
+    }
+
+    pub async fn raw_cache_get_l2(&self, key: &str) -> Option<String> {
+        if let Some(redis) = &self.redis {
+            match redis.raw_cache_get(key).await {
+                Ok(value) => return value,
+                Err(error) if self.redis_required => {
+                    eprintln!("Redis raw cache get failed while required: {}", error);
+                    return None;
+                }
+                Err(error) => eprintln!("Redis raw cache get failed: {}", error),
+            }
+        }
+        None
+    }
+
+    pub async fn raw_cache_set(&self, key: impl Into<String>, value: String, ttl: Duration) {
+        let key = key.into();
+        if let Some(redis) = &self.redis {
+            match redis.raw_cache_set(&key, &value, ttl).await {
+                Ok(()) => {
+                    self.memory
+                        .raw_cache_set(key, value, RAW_L1_FRESH_TTL, RAW_L1_STALE_TTL)
+                        .await;
+                    return;
+                }
+                Err(error) if self.redis_required => {
+                    eprintln!("Redis raw cache set failed while required: {}", error);
+                    return;
+                }
+                Err(error) => eprintln!("Redis raw cache set failed: {}", error),
+            }
+        }
+
+        self.memory.raw_cache_set(key, value, ttl, ttl).await;
+    }
+
     #[allow(dead_code)]
     pub async fn cache_remove_prefix(&self, prefix: &str) {
         if let Some(redis) = &self.redis {
             match redis.cache_remove_prefix(prefix).await {
-                Ok(()) => return,
+                Ok(()) => {}
                 Err(error) if self.redis_required => {
                     eprintln!("Redis cache remove failed while required: {}", error);
-                    return;
                 }
                 Err(error) => eprintln!(
                     "Redis cache remove failed, falling back to memory: {}",
@@ -231,6 +344,7 @@ impl SharedSecurityStore {
         }
 
         self.memory.cache_remove_prefix(prefix).await;
+        self.memory.raw_cache_remove_prefix(prefix).await;
     }
 
     pub async fn acquire_lock(&self, key: &str, ttl: Duration) -> StoreResult<Option<String>> {
@@ -276,9 +390,19 @@ impl SharedSecurityStore {
     }
 
     pub async fn get_access_policy(&self) -> StoreResult<Option<AccessPolicy>> {
+        if let Some(policy) = self.memory.get_access_policy().await {
+            return Ok(Some(policy));
+        }
+
         if let Some(redis) = &self.redis {
             match redis.get_access_policy().await {
-                Ok(policy) => return Ok(policy),
+                Ok(Some(policy)) => {
+                    self.memory
+                        .set_access_policy(policy.clone(), TYPED_L1_CACHE_TTL)
+                        .await;
+                    return Ok(Some(policy));
+                }
+                Ok(None) => return Ok(None),
                 Err(error) if self.redis_required => return Err(error),
                 Err(error) => eprintln!(
                     "Redis policy cache failed, falling back to memory: {}",
@@ -297,7 +421,12 @@ impl SharedSecurityStore {
     pub async fn set_access_policy(&self, policy: AccessPolicy, ttl: Duration) -> StoreResult<()> {
         if let Some(redis) = &self.redis {
             match redis.set_access_policy(&policy, ttl).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.memory
+                        .set_access_policy(policy, TYPED_L1_CACHE_TTL)
+                        .await;
+                    return Ok(());
+                }
                 Err(error) if self.redis_required => return Err(error),
                 Err(error) => {
                     eprintln!("Redis policy set failed, falling back to memory: {}", error)
@@ -410,24 +539,12 @@ impl RedisSecurityStore {
     ) -> StoreResult<RateLimitOutcome> {
         let key = redis_key(&format!("rate:{}", key));
         let mut conn = self.manager.clone();
-        let count = redis::cmd("INCR")
-            .arg(&key)
-            .query_async::<u32>(&mut conn)
+        let (count, ttl) = redis::Script::new(LUA_RATE_LIMITER)
+            .key(&key)
+            .arg(window.as_secs().max(1))
+            .invoke_async::<(u32, i64)>(&mut conn)
             .await
             .map_err(|error| SecurityStoreError::new(error.to_string()))?;
-        if count == 1 {
-            let _: () = redis::cmd("EXPIRE")
-                .arg(&key)
-                .arg(window.as_secs().max(1))
-                .query_async(&mut conn)
-                .await
-                .map_err(|error| SecurityStoreError::new(error.to_string()))?;
-        }
-        let ttl = redis::cmd("TTL")
-            .arg(&key)
-            .query_async::<i64>(&mut conn)
-            .await
-            .unwrap_or(window.as_secs() as i64);
         Ok(rate_outcome(count, limit, ttl.max(1) as u64))
     }
 
@@ -440,19 +557,12 @@ impl RedisSecurityStore {
         let reset_at = next_utc_midnight(now);
         let key = redis_key(&format!("quota:{}:{}", key, now.format("%Y%m%d")));
         let mut conn = self.manager.clone();
-        let count = redis::cmd("INCR")
-            .arg(&key)
-            .query_async::<u32>(&mut conn)
+        let count = redis::Script::new(LUA_DAILY_QUOTA)
+            .key(&key)
+            .arg(seconds_until(reset_at, now))
+            .invoke_async::<u32>(&mut conn)
             .await
             .map_err(|error| SecurityStoreError::new(error.to_string()))?;
-        if count == 1 {
-            let _: () = redis::cmd("EXPIRE")
-                .arg(&key)
-                .arg(seconds_until(reset_at, now))
-                .query_async(&mut conn)
-                .await
-                .map_err(|error| SecurityStoreError::new(error.to_string()))?;
-        }
         Ok(quota_outcome(count, limit, reset_at))
     }
 
@@ -474,6 +584,26 @@ impl RedisSecurityStore {
             .arg(redis_key(&format!("cache:{}", key)))
             .arg(ttl.as_secs().max(1))
             .arg(raw)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|error| SecurityStoreError::new(error.to_string()))
+    }
+
+    async fn raw_cache_get(&self, key: &str) -> StoreResult<Option<String>> {
+        let mut conn = self.manager.clone();
+        redis::cmd("GET")
+            .arg(redis_key(&format!("cache:{}", key)))
+            .query_async::<Option<String>>(&mut conn)
+            .await
+            .map_err(|error| SecurityStoreError::new(error.to_string()))
+    }
+
+    async fn raw_cache_set(&self, key: &str, value: &str, ttl: Duration) -> StoreResult<()> {
+        let mut conn = self.manager.clone();
+        redis::cmd("SETEX")
+            .arg(redis_key(&format!("cache:{}", key)))
+            .arg(ttl.as_secs().max(1))
+            .arg(value)
             .query_async::<()>(&mut conn)
             .await
             .map_err(|error| SecurityStoreError::new(error.to_string()))
@@ -604,6 +734,7 @@ struct MemorySecurityStore {
     rate_windows: Mutex<HashMap<String, MemoryRateWindow>>,
     daily_quotas: Mutex<HashMap<String, MemoryDailyQuota>>,
     cache_entries: Mutex<HashMap<String, MemoryCacheEntry>>,
+    raw_cache_entries: Mutex<HashMap<String, MemoryRawCacheEntry>>,
     policy: RwLock<Option<MemoryAccessPolicyEntry>>,
     admin_sessions: Mutex<HashMap<String, MemoryAdminSession>>,
     locks: Mutex<HashMap<String, MemoryLockEntry>>,
@@ -617,6 +748,7 @@ impl MemorySecurityStore {
             rate_windows: Mutex::new(HashMap::new()),
             daily_quotas: Mutex::new(HashMap::new()),
             cache_entries: Mutex::new(HashMap::new()),
+            raw_cache_entries: Mutex::new(HashMap::new()),
             policy: RwLock::new(None),
             admin_sessions: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
@@ -747,6 +879,61 @@ impl MemorySecurityStore {
         entries.retain(|key, _| !key.starts_with(prefix));
     }
 
+    async fn raw_cache_get(&self, key: &str) -> Option<RawCacheHit> {
+        let now = Instant::now();
+        let mut entries = self.raw_cache_entries.lock().await;
+        match entries.get(key) {
+            Some(entry) if entry.fresh_expires_at > now => Some(RawCacheHit {
+                value: entry.value.clone(),
+                state: RawCacheState::Fresh,
+            }),
+            Some(entry) if entry.stale_expires_at > now => Some(RawCacheHit {
+                value: entry.value.clone(),
+                state: RawCacheState::Stale,
+            }),
+            Some(_) => {
+                entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn raw_cache_set(
+        &self,
+        key: String,
+        value: String,
+        fresh_ttl: Duration,
+        stale_ttl: Duration,
+    ) {
+        let now = Instant::now();
+        let mut entries = self.raw_cache_entries.lock().await;
+        entries.retain(|_, entry| entry.stale_expires_at > now);
+        if !entries.contains_key(&key) && entries.len() >= self.max_cache_entries {
+            if let Some(oldest_key) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest_key);
+            }
+        }
+        entries.insert(
+            key,
+            MemoryRawCacheEntry {
+                inserted_at: now,
+                fresh_expires_at: now + fresh_ttl,
+                stale_expires_at: now + stale_ttl.max(fresh_ttl),
+                value,
+            },
+        );
+    }
+
+    async fn raw_cache_remove_prefix(&self, prefix: &str) {
+        let mut entries = self.raw_cache_entries.lock().await;
+        entries.retain(|key, _| !key.starts_with(prefix));
+    }
+
     async fn acquire_lock(&self, key: &str, token: &str, ttl: Duration) -> bool {
         let now = Instant::now();
         let mut locks = self.locks.lock().await;
@@ -840,6 +1027,14 @@ struct MemoryCacheEntry {
     value: Value,
 }
 
+#[derive(Debug)]
+struct MemoryRawCacheEntry {
+    inserted_at: Instant,
+    fresh_expires_at: Instant,
+    stale_expires_at: Instant,
+    value: String,
+}
+
 #[derive(Debug, Clone)]
 struct MemoryAccessPolicyEntry {
     policy: AccessPolicy,
@@ -904,8 +1099,9 @@ fn parse_json<T: DeserializeOwned>(raw: String) -> Option<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedSecurityStore;
+    use super::{LUA_DAILY_QUOTA, LUA_RATE_LIMITER, RawCacheState, SharedSecurityStore};
     use crate::config::{AppConfig, AppEnvironment};
+    use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -926,6 +1122,8 @@ mod tests {
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
             admin_json_limit_bytes: 16 * 1024,
+            request_logging: false,
+            response_compression: false,
         })
     }
 
@@ -992,5 +1190,54 @@ mod tests {
                 .unwrap(),
             Some(tokens.csrf_token)
         );
+    }
+
+    #[tokio::test]
+    async fn raw_cache_returns_json_without_parsing() {
+        let store = SharedSecurityStore::new(&test_config()).await;
+        store
+            .raw_cache_set(
+                "raw:json",
+                "{\"success\":true}".to_string(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let hit = store.raw_cache_get("raw:json").await.unwrap();
+
+        assert_eq!(hit.state, RawCacheState::Fresh);
+        assert_eq!(hit.value, "{\"success\":true}");
+        assert!(serde_json::from_str::<serde_json::Value>(&hit.value).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cache_remove_prefix_clears_typed_and_raw_l1_entries() {
+        let store = SharedSecurityStore::new(&test_config()).await;
+        store
+            .cache_set(
+                "prefix:typed",
+                json!({ "ok": true }),
+                Duration::from_secs(60),
+            )
+            .await;
+        store
+            .raw_cache_set(
+                "prefix:raw",
+                "{\"ok\":true}".to_string(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        store.cache_remove_prefix("prefix:").await;
+
+        assert!(store.cache_get("prefix:typed").await.is_none());
+        assert!(store.raw_cache_get("prefix:raw").await.is_none());
+    }
+
+    #[test]
+    fn redis_lua_scripts_keep_rate_limit_operations_atomic() {
+        assert!(LUA_RATE_LIMITER.contains("INCR"));
+        assert!(LUA_RATE_LIMITER.contains("TTL"));
+        assert!(LUA_DAILY_QUOTA.contains("EXPIRE"));
     }
 }

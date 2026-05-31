@@ -8,7 +8,8 @@ use actix_web::http::StatusCode;
 use actix_web::{HttpRequest, HttpResponse, Responder, get, web};
 use chrono::{DateTime, Duration, Utc};
 use mongodb::bson::doc;
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::json;
 use std::future::Future;
 use std::time::Duration as StdDuration;
 
@@ -98,32 +99,35 @@ pub async fn list_products(req: HttpRequest, state: web::Data<AppState>) -> impl
         Err(response) => return response,
     };
 
-    let cache_key = format!("{PUBLIC_CACHE_VERSION}:products");
-    let value = match cached_response(
-        state.get_ref(),
+    let app_state = state.get_ref().clone();
+    let cache_key = products_cache_key();
+    let raw = match cached_raw_response(
+        app_state.clone(),
         cache_key,
         StdDuration::from_secs(15),
-        || async {
-            match db::list_products_v2(&state.db).await {
-                Ok(products) => Ok(serde_json::to_value(ApiResponse::success(products))
-                    .unwrap_or_else(|_| json!({}))),
-                Err(error) => {
-                    eprintln!("Products query failed: {}", error);
-                    Err(security::problem(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "products_query_failed",
-                        "Products could not be loaded",
-                    ))
+        move || {
+            let app_state = app_state.clone();
+            async move {
+                match db::list_products_v2(&app_state.db).await {
+                    Ok(products) => Ok(success_json(products)),
+                    Err(error) => {
+                        eprintln!("Products query failed: {}", error);
+                        Err(RawCacheLoadError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "products_query_failed",
+                            "Products could not be loaded",
+                        ))
+                    }
                 }
             }
         },
     )
     .await
     {
-        Ok(value) => value,
-        Err(response) => return response,
+        Ok(raw) => raw,
+        Err(error) => return error.into_response(),
     };
-    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
+    security::with_auth_headers(raw_json_response(raw), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/latest")]
@@ -138,33 +142,36 @@ pub async fn latest_many(
     };
 
     let ids = parse_ids(query.ids.as_deref());
-    let cache_key = format!("{PUBLIC_CACHE_VERSION}:latest-many:{}", ids.join(","));
-    let value =
-        match cached_response(
-            state.get_ref(),
-            cache_key,
-            StdDuration::from_secs(15),
-            || async {
-                match db::get_latest_many_v2(&state.db, &ids).await {
-                    Ok(data) => Ok(serde_json::to_value(ApiResponse::success(data))
-                        .unwrap_or_else(|_| json!({}))),
+    let app_state = state.get_ref().clone();
+    let cache_key = latest_many_cache_key(&ids);
+    let raw = match cached_raw_response(
+        app_state.clone(),
+        cache_key,
+        StdDuration::from_secs(15),
+        move || {
+            let app_state = app_state.clone();
+            let ids = ids.clone();
+            async move {
+                match db::get_latest_many_v2(&app_state.db, &ids).await {
+                    Ok(data) => Ok(success_json(data)),
                     Err(error) => {
                         eprintln!("Latest many query failed: {}", error);
-                        Err(security::problem(
+                        Err(RawCacheLoadError::new(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "latest_query_failed",
                             "Latest data could not be loaded",
                         ))
                     }
                 }
-            },
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
+            }
+        },
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) => return error.into_response(),
+    };
+    security::with_auth_headers(raw_json_response(raw), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/{product_id}/latest")]
@@ -187,38 +194,41 @@ pub async fn latest_one(
         );
     }
 
-    let cache_key = format!("{PUBLIC_CACHE_VERSION}:latest:{}", product_id);
-    let value =
-        match cached_response(
-            state.get_ref(),
-            cache_key,
-            StdDuration::from_secs(15),
-            || async {
-                match db::get_latest_bazaar_data_v2(&state.db, &product_id).await {
-                    Ok(Some(data)) => Ok(serde_json::to_value(ApiResponse::success(data))
-                        .unwrap_or_else(|_| json!({}))),
-                    Ok(None) => Err(security::problem(
+    let app_state = state.get_ref().clone();
+    let cache_key = latest_one_cache_key(&product_id);
+    let raw = match cached_raw_response(
+        app_state.clone(),
+        cache_key,
+        StdDuration::from_secs(15),
+        move || {
+            let app_state = app_state.clone();
+            let product_id = product_id.clone();
+            async move {
+                match db::get_latest_bazaar_data_v2(&app_state.db, &product_id).await {
+                    Ok(Some(data)) => Ok(success_json(data)),
+                    Ok(None) => Err(RawCacheLoadError::new(
                         StatusCode::NOT_FOUND,
                         "product_not_found",
                         "Product not found",
                     )),
                     Err(error) => {
                         eprintln!("Latest one query failed: {}", error);
-                        Err(security::problem(
+                        Err(RawCacheLoadError::new(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "latest_query_failed",
                             "Latest data could not be loaded",
                         ))
                     }
                 }
-            },
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
+            }
+        },
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) => return error.into_response(),
+    };
+    security::with_auth_headers(raw_json_response(raw), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/{product_id}/candles")]
@@ -248,47 +258,52 @@ pub async fn candles(
         window.end.timestamp(),
         window.limit
     );
-    let value = match cached_response(
-        state.get_ref(),
+    let app_state = state.get_ref().clone();
+    let raw = match cached_raw_response(
+        app_state.clone(),
         cache_key,
         StdDuration::from_secs(30),
-        || async {
-            match db::get_candles(
-                &state.db,
-                &product_id,
-                &window.interval,
-                &window.metric,
-                window.start,
-                window.end,
-                window.limit,
-            )
-            .await
-            {
-                Ok(candle_rows) => {
-                    let points = candle_rows
-                        .into_iter()
-                        .map(|candle| candle_point(candle, &window.metric))
-                        .collect::<Vec<_>>();
-                    Ok(serde_json::to_value(ApiResponse::success(points))
-                        .unwrap_or_else(|_| json!({})))
-                }
-                Err(error) => {
-                    eprintln!("Candles query failed: {}", error);
-                    Err(security::problem(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "candles_query_failed",
-                        "Candles could not be loaded",
-                    ))
+        move || {
+            let app_state = app_state.clone();
+            let product_id = product_id.clone();
+            let window = window.clone();
+            async move {
+                match db::get_candles(
+                    &app_state.db,
+                    &product_id,
+                    &window.interval,
+                    &window.metric,
+                    window.start,
+                    window.end,
+                    window.limit,
+                )
+                .await
+                {
+                    Ok(candle_rows) => {
+                        let points = candle_rows
+                            .into_iter()
+                            .map(|candle| candle_point(candle, &window.metric))
+                            .collect::<Vec<_>>();
+                        Ok(success_json(points))
+                    }
+                    Err(error) => {
+                        eprintln!("Candles query failed: {}", error);
+                        Err(RawCacheLoadError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "candles_query_failed",
+                            "Candles could not be loaded",
+                        ))
+                    }
                 }
             }
         },
     )
     .await
     {
-        Ok(value) => value,
-        Err(response) => return response,
+        Ok(raw) => raw,
+        Err(error) => return error.into_response(),
     };
-    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
+    security::with_auth_headers(raw_json_response(raw), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/{product_id}/series")]
@@ -308,8 +323,8 @@ pub async fn series(
         Ok(window) => window,
         Err(response) => return response,
     };
-    let stat = query.stat.as_deref().unwrap_or("close");
-    if !["open", "high", "low", "close", "avg", "volume"].contains(&stat) {
+    let stat = query.stat.as_deref().unwrap_or("close").to_string();
+    if !["open", "high", "low", "close", "avg", "volume"].contains(&stat.as_str()) {
         return security::problem(
             StatusCode::BAD_REQUEST,
             "invalid_stat",
@@ -327,61 +342,70 @@ pub async fn series(
         window.end.timestamp(),
         window.limit
     );
-    let value = match cached_response(
-        state.get_ref(),
+    let app_state = state.get_ref().clone();
+    let raw = match cached_raw_response(
+        app_state.clone(),
         cache_key,
         StdDuration::from_secs(30),
-        || async {
-            match db::get_candles(
-                &state.db,
-                &product_id,
-                &window.interval,
-                &window.metric,
-                window.start,
-                window.end,
-                window.limit,
-            )
-            .await
-            {
-                Ok(candle_rows) => {
-                    let points = candle_rows
-                        .into_iter()
-                        .map(|candle| series_point(candle, &window.metric, stat))
-                        .collect::<Vec<_>>();
-                    Ok(serde_json::to_value(ApiResponse::success(points))
-                        .unwrap_or_else(|_| json!({})))
-                }
-                Err(error) => {
-                    eprintln!("Series query failed: {}", error);
-                    Err(security::problem(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "series_query_failed",
-                        "Series could not be loaded",
-                    ))
+        move || {
+            let app_state = app_state.clone();
+            let product_id = product_id.clone();
+            let window = window.clone();
+            let stat = stat.clone();
+            async move {
+                match db::get_candles(
+                    &app_state.db,
+                    &product_id,
+                    &window.interval,
+                    &window.metric,
+                    window.start,
+                    window.end,
+                    window.limit,
+                )
+                .await
+                {
+                    Ok(candle_rows) => {
+                        let points = candle_rows
+                            .into_iter()
+                            .map(|candle| series_point(candle, &window.metric, &stat))
+                            .collect::<Vec<_>>();
+                        Ok(success_json(points))
+                    }
+                    Err(error) => {
+                        eprintln!("Series query failed: {}", error);
+                        Err(RawCacheLoadError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "series_query_failed",
+                            "Series could not be loaded",
+                        ))
+                    }
                 }
             }
         },
     )
     .await
     {
-        Ok(value) => value,
-        Err(response) => return response,
+        Ok(raw) => raw,
+        Err(error) => return error.into_response(),
     };
-    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
+    security::with_auth_headers(raw_json_response(raw), &auth)
 }
 
-async fn cached_response<F, Fut>(
-    state: &AppState,
+async fn cached_raw_response<F, Fut>(
+    state: AppState,
     cache_key: String,
     ttl: StdDuration,
     load: F,
-) -> Result<Value, HttpResponse>
+) -> Result<String, RawCacheLoadError>
 where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<Value, HttpResponse>>,
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, RawCacheLoadError>> + Send + 'static,
 {
-    if let Some(value) = state.security_store.cache_get(&cache_key).await {
-        return Ok(value);
+    if let Some(hit) = state.security_store.raw_cache_get(&cache_key).await {
+        if hit.is_stale() {
+            spawn_raw_cache_refresh(state, cache_key, ttl, load);
+        }
+        return Ok(hit.value);
     }
 
     let lock_key = format!("cache-fill:{}", cache_key);
@@ -398,8 +422,8 @@ where
     };
 
     if lock_token.is_none() {
-        if let Some(value) = wait_for_cached_response(state, &cache_key).await {
-            return Ok(value);
+        if let Some(hit) = wait_for_raw_cached_response(&state, &cache_key).await {
+            return Ok(hit.value);
         }
     }
 
@@ -407,7 +431,7 @@ where
     if let Ok(value) = &result {
         state
             .security_store
-            .cache_set(cache_key, value.clone(), ttl)
+            .raw_cache_set(cache_key.clone(), value.clone(), ttl)
             .await;
     }
 
@@ -420,16 +444,105 @@ where
     result
 }
 
-async fn wait_for_cached_response(state: &AppState, cache_key: &str) -> Option<Value> {
+fn spawn_raw_cache_refresh<F, Fut>(state: AppState, cache_key: String, ttl: StdDuration, load: F)
+where
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, RawCacheLoadError>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let lock_key = format!("cache-fill:{}", cache_key);
+        let token = match state
+            .security_store
+            .acquire_lock(&lock_key, StdDuration::from_secs(5))
+            .await
+        {
+            Ok(Some(token)) => token,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("Response cache refresh lock failed: {}", error);
+                return;
+            }
+        };
+
+        if let Some(value) = state.security_store.raw_cache_get_l2(&cache_key).await {
+            state
+                .security_store
+                .raw_cache_set(cache_key.clone(), value, ttl)
+                .await;
+            let _ = state.security_store.release_lock(&lock_key, &token).await;
+            return;
+        }
+
+        if let Ok(value) = load().await {
+            state
+                .security_store
+                .raw_cache_set(cache_key.clone(), value, ttl)
+                .await;
+        }
+
+        if let Err(error) = state.security_store.release_lock(&lock_key, &token).await {
+            eprintln!("Response cache refresh lock release failed: {}", error);
+        }
+    });
+}
+
+async fn wait_for_raw_cached_response(
+    state: &AppState,
+    cache_key: &str,
+) -> Option<crate::shared_store::RawCacheHit> {
     for _ in 0..20 {
         tokio::time::sleep(StdDuration::from_millis(25)).await;
-        if let Some(value) = state.security_store.cache_get(cache_key).await {
-            return Some(value);
+        if let Some(hit) = state.security_store.raw_cache_get(cache_key).await {
+            return Some(hit);
         }
     }
     None
 }
 
+pub fn products_cache_key() -> String {
+    format!("{PUBLIC_CACHE_VERSION}:products")
+}
+
+pub fn latest_many_cache_key(ids: &[String]) -> String {
+    format!("{PUBLIC_CACHE_VERSION}:latest-many:{}", ids.join(","))
+}
+
+pub fn latest_one_cache_key(product_id: &str) -> String {
+    format!("{PUBLIC_CACHE_VERSION}:latest:{}", product_id)
+}
+
+pub fn success_json<T: Serialize>(data: T) -> String {
+    serde_json::to_string(&ApiResponse::success(data)).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn raw_json_response(raw: String) -> HttpResponse {
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "application/json"))
+        .body(raw)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawCacheLoadError {
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+}
+
+impl RawCacheLoadError {
+    fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
+        Self {
+            status,
+            code,
+            message,
+        }
+    }
+
+    fn into_response(self) -> HttpResponse {
+        security::problem(self.status, self.code, self.message)
+    }
+}
+
+#[derive(Clone)]
 struct ChartWindow {
     interval: String,
     metric: String,
@@ -628,7 +741,7 @@ fn valid_product_id(product_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, valid_product_id};
+    use super::{parse_range, products_cache_key, success_json, valid_product_id};
 
     #[test]
     fn product_id_validation_is_strict_but_hypixel_friendly() {
@@ -642,5 +755,15 @@ mod tests {
         assert_eq!(parse_range("1d").unwrap().num_hours(), 24);
         assert_eq!(parse_range("2w").unwrap().num_days(), 14);
         assert!(parse_range("bad").is_err());
+    }
+
+    #[test]
+    fn raw_success_json_preserves_api_shape() {
+        let raw = success_json(vec!["WHEAT".to_string()]);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["data"][0], "WHEAT");
+        assert_eq!(products_cache_key(), "v3:products");
     }
 }

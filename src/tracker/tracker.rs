@@ -1,6 +1,6 @@
-use crate::db;
-use crate::models::BazaarData;
+use crate::models::{BazaarData, BazaarLatest};
 use crate::state::{AppState, ProductSnapshot};
+use crate::{api, db};
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT_ENCODING, IF_MODIFIED_SINCE, LAST_MODIFIED};
 use serde::Deserialize;
@@ -79,6 +79,7 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
 
     let response = request.send().await?;
     if response.status() == StatusCode::NOT_MODIFIED {
+        refresh_latest_response_caches_from_state(state).await;
         return Ok(());
     }
     let response = response.error_for_status()?;
@@ -99,6 +100,7 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
             if let Some(last_modified) = last_modified {
                 *state.hypixel_last_modified.write().await = Some(last_modified);
             }
+            refresh_latest_response_caches_from_state(state).await;
             return Ok(());
         }
         *stored_last_updated = Some(last_updated);
@@ -165,6 +167,7 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
     }
 
     if changed.is_empty() {
+        refresh_latest_response_caches_from_state(state).await;
         return Ok(());
     }
 
@@ -186,9 +189,74 @@ async fn update_bazaar_data(state: &AppState) -> Result<(), Box<dyn std::error::
         },
     )
     .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    refresh_latest_response_caches(state, &changed).await;
     println!("Tracker stored {} changed products", changed.len());
 
     Ok(())
+}
+
+async fn refresh_latest_response_caches(state: &AppState, changed: &[BazaarData]) {
+    {
+        let mut latest_cache = state.latest_cache.write().await;
+        for item in changed {
+            latest_cache.insert(item.product_id.clone(), BazaarLatest::from(item.clone()));
+        }
+    }
+
+    refresh_latest_response_caches_from_state(state).await;
+}
+
+async fn refresh_latest_response_caches_from_state(state: &AppState) {
+    let (products_json, latest_json, latest_one_jsons) = {
+        let latest_cache = state.latest_cache.read().await;
+        if latest_cache.is_empty() {
+            return;
+        }
+
+        let mut all = latest_cache.values().cloned().collect::<Vec<_>>();
+        all.sort_by(|left, right| left.product_id.cmp(&right.product_id));
+        let products = all
+            .iter()
+            .map(|item| item.product_id.clone())
+            .collect::<Vec<_>>();
+        let latest_one_jsons = all
+            .iter()
+            .map(|latest| (latest.product_id.clone(), api::success_json(latest.clone())))
+            .collect::<Vec<_>>();
+
+        (
+            api::success_json(products),
+            api::success_json(all),
+            latest_one_jsons,
+        )
+    };
+
+    state
+        .security_store
+        .raw_cache_set(
+            api::products_cache_key(),
+            products_json,
+            Duration::from_secs(15),
+        )
+        .await;
+    state
+        .security_store
+        .raw_cache_set(
+            api::latest_many_cache_key(&[]),
+            latest_json,
+            Duration::from_secs(15),
+        )
+        .await;
+    for (product_id, raw) in latest_one_jsons {
+        state
+            .security_store
+            .raw_cache_set(
+                api::latest_one_cache_key(&product_id),
+                raw,
+                Duration::from_secs(15),
+            )
+            .await;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +321,8 @@ mod tests {
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
             admin_json_limit_bytes: 16 * 1024,
+            request_logging: false,
+            response_compression: false,
         });
         let client = Client::with_uri_str(&config.mongodb_uri).await.unwrap();
         let state = AppState::new(client.database(&config.mongodb_db), config).await;

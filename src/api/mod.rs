@@ -8,5 +8,6 @@ pub use self::admin::{
 };
 
 pub use self::v2::{
-    candles, health, latest_many, latest_one, list_products, openapi, ready, series,
+    candles, health, latest_many, latest_many_cache_key, latest_one, latest_one_cache_key,
+    list_products, openapi, products_cache_key, ready, series, success_json,
 };
