@@ -221,12 +221,17 @@ async fn refresh_latest_response_caches_from_state(state: &AppState) {
             .collect::<Vec<_>>();
         let latest_one_jsons = all
             .iter()
-            .map(|latest| (latest.product_id.clone(), api::success_json(latest.clone())))
+            .map(|latest| {
+                (
+                    latest.product_id.clone(),
+                    api::success_json_bytes(latest.clone()),
+                )
+            })
             .collect::<Vec<_>>();
 
         (
-            api::success_json(products),
-            api::success_json(all),
+            api::success_json_bytes(products),
+            api::success_json_bytes(all),
             latest_one_jsons,
         )
     };
@@ -320,6 +325,7 @@ mod tests {
             admin_cookie_secure: false,
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
+            rate_limit_reservation_size: 64,
             admin_json_limit_bytes: 16 * 1024,
             request_logging: false,
             response_compression: false,

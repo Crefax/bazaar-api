@@ -98,6 +98,7 @@ Environment variables:
 | `ADMIN_COOKIE_SECURE` | env-based | Defaults to true in production and false in development. |
 | `CACHE_MAX_ENTRIES` | `10000` | Bounded local cache entries for development fallback. |
 | `RATE_LIMIT_MAX_KEYS` | `50000` | Bounded local rate/quota keys for development fallback. |
+| `RATE_LIMIT_RESERVATION_SIZE` | `64` | API-key rate limit batch size before syncing to Redis. Set `1` for exact per-request Redis checks. Batching favors users: unsynced local requests can become extra allowance, not early loss. |
 | `ADMIN_JSON_LIMIT_BYTES` | `16384` | JSON payload limit. |
 | `REQUEST_LOGGING` | env-based | Defaults to true in development and false in production. Disable for benchmarks. |
 | `RESPONSE_COMPRESSION` | env-based | Defaults to true in development and false in production. Keep off when Cloudflare/edge compression handles gzip. |

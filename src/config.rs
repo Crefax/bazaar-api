@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub admin_cookie_secure: bool,
     pub cache_max_entries: usize,
     pub rate_limit_max_keys: usize,
+    pub rate_limit_reservation_size: u32,
     pub admin_json_limit_bytes: usize,
     pub request_logging: bool,
     pub response_compression: bool,
@@ -80,6 +81,7 @@ impl AppConfig {
             admin_cookie_secure,
             cache_max_entries: parse_usize_env("CACHE_MAX_ENTRIES", 10_000),
             rate_limit_max_keys: parse_usize_env("RATE_LIMIT_MAX_KEYS", 50_000),
+            rate_limit_reservation_size: parse_u32_env("RATE_LIMIT_RESERVATION_SIZE", 64),
             admin_json_limit_bytes: parse_usize_env("ADMIN_JSON_LIMIT_BYTES", 16 * 1024),
             request_logging: env::var("REQUEST_LOGGING")
                 .ok()
@@ -123,6 +125,14 @@ fn parse_usize_env(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_u32_env(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
 }

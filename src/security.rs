@@ -768,6 +768,7 @@ mod tests {
             admin_cookie_secure: false,
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
+            rate_limit_reservation_size: 64,
             admin_json_limit_bytes: 16 * 1024,
             request_logging: false,
             response_compression: false,

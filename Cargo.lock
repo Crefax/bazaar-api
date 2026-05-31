@@ -369,6 +369,7 @@ dependencies = [
  "actix-cors",
  "actix-web",
  "bson",
+ "bytes",
  "chrono",
  "dotenvy",
  "futures",

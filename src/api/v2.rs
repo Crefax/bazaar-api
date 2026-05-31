@@ -6,6 +6,7 @@ use crate::security;
 use crate::state::AppState;
 use actix_web::http::StatusCode;
 use actix_web::{HttpRequest, HttpResponse, Responder, get, web};
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use mongodb::bson::doc;
 use serde::Serialize;
@@ -109,7 +110,7 @@ pub async fn list_products(req: HttpRequest, state: web::Data<AppState>) -> impl
             let app_state = app_state.clone();
             async move {
                 match db::list_products_v2(&app_state.db).await {
-                    Ok(products) => Ok(success_json(products)),
+                    Ok(products) => Ok(success_json_bytes(products)),
                     Err(error) => {
                         eprintln!("Products query failed: {}", error);
                         Err(RawCacheLoadError::new(
@@ -153,7 +154,7 @@ pub async fn latest_many(
             let ids = ids.clone();
             async move {
                 match db::get_latest_many_v2(&app_state.db, &ids).await {
-                    Ok(data) => Ok(success_json(data)),
+                    Ok(data) => Ok(success_json_bytes(data)),
                     Err(error) => {
                         eprintln!("Latest many query failed: {}", error);
                         Err(RawCacheLoadError::new(
@@ -205,7 +206,7 @@ pub async fn latest_one(
             let product_id = product_id.clone();
             async move {
                 match db::get_latest_bazaar_data_v2(&app_state.db, &product_id).await {
-                    Ok(Some(data)) => Ok(success_json(data)),
+                    Ok(Some(data)) => Ok(success_json_bytes(data)),
                     Ok(None) => Err(RawCacheLoadError::new(
                         StatusCode::NOT_FOUND,
                         "product_not_found",
@@ -284,7 +285,7 @@ pub async fn candles(
                             .into_iter()
                             .map(|candle| candle_point(candle, &window.metric))
                             .collect::<Vec<_>>();
-                        Ok(success_json(points))
+                        Ok(success_json_bytes(points))
                     }
                     Err(error) => {
                         eprintln!("Candles query failed: {}", error);
@@ -369,7 +370,7 @@ pub async fn series(
                             .into_iter()
                             .map(|candle| series_point(candle, &window.metric, &stat))
                             .collect::<Vec<_>>();
-                        Ok(success_json(points))
+                        Ok(success_json_bytes(points))
                     }
                     Err(error) => {
                         eprintln!("Series query failed: {}", error);
@@ -396,10 +397,10 @@ async fn cached_raw_response<F, Fut>(
     cache_key: String,
     ttl: StdDuration,
     load: F,
-) -> Result<String, RawCacheLoadError>
+) -> Result<Bytes, RawCacheLoadError>
 where
     F: Fn() -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<String, RawCacheLoadError>> + Send + 'static,
+    Fut: Future<Output = Result<Bytes, RawCacheLoadError>> + Send + 'static,
 {
     if let Some(hit) = state.security_store.raw_cache_get(&cache_key).await {
         if hit.is_stale() {
@@ -447,7 +448,7 @@ where
 fn spawn_raw_cache_refresh<F, Fut>(state: AppState, cache_key: String, ttl: StdDuration, load: F)
 where
     F: Fn() -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<String, RawCacheLoadError>> + Send + 'static,
+    Fut: Future<Output = Result<Bytes, RawCacheLoadError>> + Send + 'static,
 {
     tokio::spawn(async move {
         let lock_key = format!("cache-fill:{}", cache_key);
@@ -515,7 +516,11 @@ pub fn success_json<T: Serialize>(data: T) -> String {
     serde_json::to_string(&ApiResponse::success(data)).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn raw_json_response(raw: String) -> HttpResponse {
+pub fn success_json_bytes<T: Serialize>(data: T) -> Bytes {
+    Bytes::from(success_json(data).into_bytes())
+}
+
+fn raw_json_response(raw: Bytes) -> HttpResponse {
     HttpResponse::Ok()
         .insert_header(("Content-Type", "application/json"))
         .body(raw)

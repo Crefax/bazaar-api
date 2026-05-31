@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::models::AccessPolicy;
+use bytes::Bytes;
 use chrono::{DateTime, Days, Utc};
 use redis::aio::ConnectionManager;
 use serde::de::DeserializeOwned;
@@ -17,8 +18,9 @@ const RAW_L1_STALE_TTL: Duration = Duration::from_secs(30);
 const LUA_RATE_LIMITER: &str = r#"
 local key = KEYS[1]
 local window = tonumber(ARGV[1])
-local current = redis.call('INCR', key)
-if current == 1 then
+local amount = tonumber(ARGV[2])
+local current = redis.call('INCRBY', key, amount)
+if current == amount then
     redis.call('EXPIRE', key, window)
 end
 local ttl = redis.call('TTL', key)
@@ -69,7 +71,7 @@ pub struct StoreReadiness {
 
 #[derive(Debug, Clone)]
 pub struct RawCacheHit {
-    pub value: String,
+    pub value: Bytes,
     pub state: RawCacheState,
 }
 
@@ -82,6 +84,52 @@ pub enum RawCacheState {
 impl RawCacheHit {
     pub fn is_stale(&self) -> bool {
         self.state == RawCacheState::Stale
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RateLimitReservation {
+    pending: u32,
+    known_remaining: u32,
+    expires_at: Instant,
+    blocked: bool,
+    limit: u32,
+}
+
+impl RateLimitReservation {
+    fn try_consume_local(&mut self, now: Instant, batch_size: u32) -> Option<RateLimitOutcome> {
+        if self.expires_at <= now {
+            return None;
+        }
+
+        let retry_after_seconds = self
+            .expires_at
+            .checked_duration_since(now)
+            .unwrap_or_else(|| Duration::from_secs(1))
+            .as_secs()
+            .max(1);
+
+        if self.blocked {
+            return Some(RateLimitOutcome {
+                allowed: false,
+                limit: self.limit,
+                remaining: 0,
+                retry_after_seconds,
+            });
+        }
+
+        let local_capacity = batch_size.saturating_sub(1);
+        if self.pending >= local_capacity || self.pending >= self.known_remaining {
+            return None;
+        }
+
+        self.pending += 1;
+        Some(RateLimitOutcome {
+            allowed: true,
+            limit: self.limit,
+            remaining: self.known_remaining.saturating_sub(self.pending),
+            retry_after_seconds,
+        })
     }
 }
 
@@ -112,6 +160,9 @@ type StoreResult<T> = Result<T, SecurityStoreError>;
 pub struct SharedSecurityStore {
     redis: Option<RedisSecurityStore>,
     memory: Arc<MemorySecurityStore>,
+    rate_limit_reservations: Arc<Mutex<HashMap<String, RateLimitReservation>>>,
+    rate_limit_reservation_size: u32,
+    max_rate_keys: usize,
     redis_required: bool,
     redis_init_error: Option<String>,
 }
@@ -122,6 +173,7 @@ impl SharedSecurityStore {
             config.cache_max_entries,
             config.rate_limit_max_keys,
         ));
+        let rate_limit_reservations = Arc::new(Mutex::new(HashMap::new()));
         let redis_required = config.redis_required();
 
         if let Some(redis_url) = &config.redis_url {
@@ -130,6 +182,9 @@ impl SharedSecurityStore {
                     return Self {
                         redis: Some(redis),
                         memory,
+                        rate_limit_reservations,
+                        rate_limit_reservation_size: config.rate_limit_reservation_size.max(1),
+                        max_rate_keys: config.rate_limit_max_keys,
                         redis_required,
                         redis_init_error: None,
                     };
@@ -139,6 +194,9 @@ impl SharedSecurityStore {
                     return Self {
                         redis: None,
                         memory,
+                        rate_limit_reservations,
+                        rate_limit_reservation_size: config.rate_limit_reservation_size.max(1),
+                        max_rate_keys: config.rate_limit_max_keys,
                         redis_required,
                         redis_init_error: Some(error.to_string()),
                     };
@@ -149,6 +207,9 @@ impl SharedSecurityStore {
         Self {
             redis: None,
             memory,
+            rate_limit_reservations,
+            rate_limit_reservation_size: config.rate_limit_reservation_size.max(1),
+            max_rate_keys: config.rate_limit_max_keys,
             redis_required,
             redis_init_error: None,
         }
@@ -182,7 +243,13 @@ impl SharedSecurityStore {
         window: Duration,
     ) -> StoreResult<RateLimitOutcome> {
         if let Some(redis) = &self.redis {
-            match redis.check_rate_limit(key, limit, window).await {
+            let result = if self.rate_limit_reservation_size > 1 && reservable_rate_key(key) {
+                self.check_rate_limit_with_local_reservation(redis, key, limit, window)
+                    .await
+            } else {
+                redis.check_rate_limit(key, limit, window).await
+            };
+            match result {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) if self.redis_required => return Err(error),
                 Err(error) => {
@@ -196,6 +263,66 @@ impl SharedSecurityStore {
         }
 
         self.memory.check_rate_limit(key, limit, window).await
+    }
+
+    async fn check_rate_limit_with_local_reservation(
+        &self,
+        redis: &RedisSecurityStore,
+        key: &str,
+        limit: u32,
+        window: Duration,
+    ) -> StoreResult<RateLimitOutcome> {
+        let limit = limit.max(1);
+        let batch_size = self.rate_limit_reservation_size.min(limit).max(1);
+        if batch_size == 1 {
+            return redis.check_rate_limit(key, limit, window).await;
+        }
+
+        let now = Instant::now();
+        let reservation_key = rate_reservation_key(key, limit, window);
+        let mut reservations = self.rate_limit_reservations.lock().await;
+        reservations.retain(|_, entry| entry.expires_at > now);
+
+        if let Some(entry) = reservations.get_mut(&reservation_key)
+            && let Some(outcome) = entry.try_consume_local(now, batch_size)
+        {
+            return Ok(outcome);
+        }
+
+        if !reservations.contains_key(&reservation_key) && reservations.len() >= self.max_rate_keys
+        {
+            return redis.check_rate_limit(key, limit, window).await;
+        }
+
+        let pending = reservations
+            .get(&reservation_key)
+            .map(|entry| entry.pending)
+            .unwrap_or(0);
+        let amount = pending.saturating_add(1);
+        let outcome = match redis
+            .check_rate_limit_batch(key, limit, window, amount)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                reservations.remove(&reservation_key);
+                return Err(error);
+            }
+        };
+
+        let expires_at = Instant::now() + Duration::from_secs(outcome.retry_after_seconds.max(1));
+        reservations.insert(
+            reservation_key,
+            RateLimitReservation {
+                pending: 0,
+                known_remaining: outcome.remaining,
+                expires_at,
+                blocked: !outcome.allowed,
+                limit: outcome.limit,
+            },
+        );
+
+        Ok(outcome)
     }
 
     pub async fn check_daily_quota(
@@ -293,7 +420,7 @@ impl SharedSecurityStore {
         None
     }
 
-    pub async fn raw_cache_get_l2(&self, key: &str) -> Option<String> {
+    pub async fn raw_cache_get_l2(&self, key: &str) -> Option<Bytes> {
         if let Some(redis) = &self.redis {
             match redis.raw_cache_get(key).await {
                 Ok(value) => return value,
@@ -307,10 +434,10 @@ impl SharedSecurityStore {
         None
     }
 
-    pub async fn raw_cache_set(&self, key: impl Into<String>, value: String, ttl: Duration) {
+    pub async fn raw_cache_set(&self, key: impl Into<String>, value: Bytes, ttl: Duration) {
         let key = key.into();
         if let Some(redis) = &self.redis {
-            match redis.raw_cache_set(&key, &value, ttl).await {
+            match redis.raw_cache_set(&key, value.as_ref(), ttl).await {
                 Ok(()) => {
                     self.memory
                         .raw_cache_set(key, value, RAW_L1_FRESH_TTL, RAW_L1_STALE_TTL)
@@ -537,11 +664,22 @@ impl RedisSecurityStore {
         limit: u32,
         window: Duration,
     ) -> StoreResult<RateLimitOutcome> {
+        self.check_rate_limit_batch(key, limit, window, 1).await
+    }
+
+    async fn check_rate_limit_batch(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+        amount: u32,
+    ) -> StoreResult<RateLimitOutcome> {
         let key = redis_key(&format!("rate:{}", key));
         let mut conn = self.manager.clone();
         let (count, ttl) = redis::Script::new(LUA_RATE_LIMITER)
             .key(&key)
             .arg(window.as_secs().max(1))
+            .arg(amount.max(1))
             .invoke_async::<(u32, i64)>(&mut conn)
             .await
             .map_err(|error| SecurityStoreError::new(error.to_string()))?;
@@ -589,16 +727,17 @@ impl RedisSecurityStore {
             .map_err(|error| SecurityStoreError::new(error.to_string()))
     }
 
-    async fn raw_cache_get(&self, key: &str) -> StoreResult<Option<String>> {
+    async fn raw_cache_get(&self, key: &str) -> StoreResult<Option<Bytes>> {
         let mut conn = self.manager.clone();
-        redis::cmd("GET")
+        let raw = redis::cmd("GET")
             .arg(redis_key(&format!("cache:{}", key)))
-            .query_async::<Option<String>>(&mut conn)
+            .query_async::<Option<Vec<u8>>>(&mut conn)
             .await
-            .map_err(|error| SecurityStoreError::new(error.to_string()))
+            .map_err(|error| SecurityStoreError::new(error.to_string()))?;
+        Ok(raw.map(Bytes::from))
     }
 
-    async fn raw_cache_set(&self, key: &str, value: &str, ttl: Duration) -> StoreResult<()> {
+    async fn raw_cache_set(&self, key: &str, value: &[u8], ttl: Duration) -> StoreResult<()> {
         let mut conn = self.manager.clone();
         redis::cmd("SETEX")
             .arg(redis_key(&format!("cache:{}", key)))
@@ -902,7 +1041,7 @@ impl MemorySecurityStore {
     async fn raw_cache_set(
         &self,
         key: String,
-        value: String,
+        value: Bytes,
         fresh_ttl: Duration,
         stale_ttl: Duration,
     ) {
@@ -1032,7 +1171,7 @@ struct MemoryRawCacheEntry {
     inserted_at: Instant,
     fresh_expires_at: Instant,
     stale_expires_at: Instant,
-    value: String,
+    value: Bytes,
 }
 
 #[derive(Debug, Clone)]
@@ -1055,6 +1194,14 @@ struct MemoryLockEntry {
 
 fn redis_key(suffix: &str) -> String {
     format!("{}{}", REDIS_KEY_PREFIX, suffix)
+}
+
+fn reservable_rate_key(key: &str) -> bool {
+    key.starts_with("api-key:")
+}
+
+fn rate_reservation_key(key: &str, limit: u32, window: Duration) -> String {
+    format!("{}:{}:{}", key, limit.max(1), window.as_secs().max(1))
 }
 
 fn rate_outcome(count: u32, limit: u32, retry_after_seconds: u64) -> RateLimitOutcome {
@@ -1101,6 +1248,7 @@ fn parse_json<T: DeserializeOwned>(raw: String) -> Option<T> {
 mod tests {
     use super::{LUA_DAILY_QUOTA, LUA_RATE_LIMITER, RawCacheState, SharedSecurityStore};
     use crate::config::{AppConfig, AppEnvironment};
+    use bytes::Bytes;
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1121,6 +1269,7 @@ mod tests {
             admin_cookie_secure: false,
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
+            rate_limit_reservation_size: 64,
             admin_json_limit_bytes: 16 * 1024,
             request_logging: false,
             response_compression: false,
@@ -1198,7 +1347,7 @@ mod tests {
         store
             .raw_cache_set(
                 "raw:json",
-                "{\"success\":true}".to_string(),
+                Bytes::from_static(br#"{"success":true}"#),
                 Duration::from_secs(60),
             )
             .await;
@@ -1206,8 +1355,8 @@ mod tests {
         let hit = store.raw_cache_get("raw:json").await.unwrap();
 
         assert_eq!(hit.state, RawCacheState::Fresh);
-        assert_eq!(hit.value, "{\"success\":true}");
-        assert!(serde_json::from_str::<serde_json::Value>(&hit.value).is_ok());
+        assert_eq!(hit.value, Bytes::from_static(br#"{"success":true}"#));
+        assert!(serde_json::from_slice::<serde_json::Value>(&hit.value).is_ok());
     }
 
     #[tokio::test]
@@ -1223,7 +1372,7 @@ mod tests {
         store
             .raw_cache_set(
                 "prefix:raw",
-                "{\"ok\":true}".to_string(),
+                Bytes::from_static(br#"{"ok":true}"#),
                 Duration::from_secs(60),
             )
             .await;
@@ -1236,8 +1385,35 @@ mod tests {
 
     #[test]
     fn redis_lua_scripts_keep_rate_limit_operations_atomic() {
-        assert!(LUA_RATE_LIMITER.contains("INCR"));
+        assert!(LUA_RATE_LIMITER.contains("INCRBY"));
         assert!(LUA_RATE_LIMITER.contains("TTL"));
         assert!(LUA_DAILY_QUOTA.contains("EXPIRE"));
+    }
+
+    #[test]
+    fn local_rate_reservation_grants_user_favoring_batch_credit() {
+        let now = std::time::Instant::now();
+        let mut reservation = super::RateLimitReservation {
+            pending: 0,
+            known_remaining: 100,
+            expires_at: now + Duration::from_secs(60),
+            blocked: false,
+            limit: 1000,
+        };
+
+        for expected_pending in 1..=63 {
+            let outcome = reservation.try_consume_local(now, 64).unwrap();
+            assert!(outcome.allowed);
+            assert_eq!(reservation.pending, expected_pending);
+        }
+
+        assert!(reservation.try_consume_local(now, 64).is_none());
+    }
+
+    #[test]
+    fn only_user_api_key_limits_use_local_reservation() {
+        assert!(super::reservable_rate_key("api-key:abc"));
+        assert!(!super::reservable_rate_key("anonymous:127.0.0.1"));
+        assert!(!super::reservable_rate_key("admin-login-minute:127.0.0.1"));
     }
 }
