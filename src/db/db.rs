@@ -813,6 +813,15 @@ pub async fn find_api_key_by_prefix(
     Ok(collection.find_one(doc! { "key_prefix": prefix }).await?)
 }
 
+pub async fn find_api_key_by_id(
+    db: &Database,
+    id: &str,
+) -> Result<Option<ApiKeyRecord>, Box<dyn std::error::Error>> {
+    let object_id = ObjectId::parse_str(id)?;
+    let collection = db.collection::<ApiKeyRecord>("api_keys");
+    Ok(collection.find_one(doc! { "_id": object_id }).await?)
+}
+
 pub async fn touch_api_key_last_used(
     db: &Database,
     id: &str,

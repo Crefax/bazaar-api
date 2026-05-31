@@ -28,6 +28,10 @@ Copy the example env file and replace placeholder secrets:
 Copy-Item .env.example .env
 ```
 
+The service loads `.env` automatically at startup from the working directory or
+near the executable. Existing process environment variables take precedence over
+values in `.env`.
+
 Minimal local run:
 
 ```powershell
@@ -186,7 +190,7 @@ Create a user key with a daily quota:
 $body = @{
   name = "Example Client"
   owner_email = "client@example.com"
-  rate_limit_per_minute = 600
+  rate_limit_per_minute = 1000
   daily_quota = 100000
 } | ConvertTo-Json
 
@@ -209,7 +213,7 @@ Invoke-RestMethod `
 ## Security Behavior
 
 - Anonymous public rate limit default: `120 req/min/IP`.
-- User API key rate limit default: `600 req/min/key`.
+- User API key rate limit default: `1000 req/min/key`; configured keys are capped at `10000000 req/min/key`.
 - Admin login limits: `5 req/min/IP` and `50 req/hour/IP`.
 - Admin API limit: `120 req/min/session-or-admin-key`.
 - Daily quotas reset at UTC midnight.

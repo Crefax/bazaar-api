@@ -8,7 +8,8 @@ use actix_web::http::StatusCode;
 use actix_web::{HttpRequest, HttpResponse, Responder, get, web};
 use chrono::{DateTime, Duration, Utc};
 use mongodb::bson::doc;
-use serde_json::json;
+use serde_json::{Value, json};
+use std::future::Future;
 use std::time::Duration as StdDuration;
 
 const BAZAAR_READ_SCOPE: &str = "bazaar:read";
@@ -98,29 +99,31 @@ pub async fn list_products(req: HttpRequest, state: web::Data<AppState>) -> impl
     };
 
     let cache_key = format!("{PUBLIC_CACHE_VERSION}:products");
-    if let Some(value) = state.security_store.cache_get(&cache_key).await {
-        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
-    }
-
-    match db::list_products_v2(&state.db).await {
-        Ok(products) => {
-            let value =
-                serde_json::to_value(ApiResponse::success(products)).unwrap_or_else(|_| json!({}));
-            state
-                .security_store
-                .cache_set(cache_key, value.clone(), StdDuration::from_secs(15))
-                .await;
-            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
-        }
-        Err(error) => {
-            eprintln!("Products query failed: {}", error);
-            security::problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "products_query_failed",
-                "Products could not be loaded",
-            )
-        }
-    }
+    let value = match cached_response(
+        state.get_ref(),
+        cache_key,
+        StdDuration::from_secs(15),
+        || async {
+            match db::list_products_v2(&state.db).await {
+                Ok(products) => Ok(serde_json::to_value(ApiResponse::success(products))
+                    .unwrap_or_else(|_| json!({}))),
+                Err(error) => {
+                    eprintln!("Products query failed: {}", error);
+                    Err(security::problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "products_query_failed",
+                        "Products could not be loaded",
+                    ))
+                }
+            }
+        },
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/latest")]
@@ -136,29 +139,32 @@ pub async fn latest_many(
 
     let ids = parse_ids(query.ids.as_deref());
     let cache_key = format!("{PUBLIC_CACHE_VERSION}:latest-many:{}", ids.join(","));
-    if let Some(value) = state.security_store.cache_get(&cache_key).await {
-        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
-    }
-
-    match db::get_latest_many_v2(&state.db, &ids).await {
-        Ok(data) => {
-            let value =
-                serde_json::to_value(ApiResponse::success(data)).unwrap_or_else(|_| json!({}));
-            state
-                .security_store
-                .cache_set(cache_key, value.clone(), StdDuration::from_secs(15))
-                .await;
-            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
-        }
-        Err(error) => {
-            eprintln!("Latest many query failed: {}", error);
-            security::problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "latest_query_failed",
-                "Latest data could not be loaded",
-            )
-        }
-    }
+    let value =
+        match cached_response(
+            state.get_ref(),
+            cache_key,
+            StdDuration::from_secs(15),
+            || async {
+                match db::get_latest_many_v2(&state.db, &ids).await {
+                    Ok(data) => Ok(serde_json::to_value(ApiResponse::success(data))
+                        .unwrap_or_else(|_| json!({}))),
+                    Err(error) => {
+                        eprintln!("Latest many query failed: {}", error);
+                        Err(security::problem(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "latest_query_failed",
+                            "Latest data could not be loaded",
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/{product_id}/latest")]
@@ -182,34 +188,37 @@ pub async fn latest_one(
     }
 
     let cache_key = format!("{PUBLIC_CACHE_VERSION}:latest:{}", product_id);
-    if let Some(value) = state.security_store.cache_get(&cache_key).await {
-        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
-    }
-
-    match db::get_latest_bazaar_data_v2(&state.db, &product_id).await {
-        Ok(Some(data)) => {
-            let value =
-                serde_json::to_value(ApiResponse::success(data)).unwrap_or_else(|_| json!({}));
-            state
-                .security_store
-                .cache_set(cache_key, value.clone(), StdDuration::from_secs(15))
-                .await;
-            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
-        }
-        Ok(None) => security::problem(
-            StatusCode::NOT_FOUND,
-            "product_not_found",
-            "Product not found",
-        ),
-        Err(error) => {
-            eprintln!("Latest one query failed: {}", error);
-            security::problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "latest_query_failed",
-                "Latest data could not be loaded",
-            )
-        }
-    }
+    let value =
+        match cached_response(
+            state.get_ref(),
+            cache_key,
+            StdDuration::from_secs(15),
+            || async {
+                match db::get_latest_bazaar_data_v2(&state.db, &product_id).await {
+                    Ok(Some(data)) => Ok(serde_json::to_value(ApiResponse::success(data))
+                        .unwrap_or_else(|_| json!({}))),
+                    Ok(None) => Err(security::problem(
+                        StatusCode::NOT_FOUND,
+                        "product_not_found",
+                        "Product not found",
+                    )),
+                    Err(error) => {
+                        eprintln!("Latest one query failed: {}", error);
+                        Err(security::problem(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "latest_query_failed",
+                            "Latest data could not be loaded",
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/{product_id}/candles")]
@@ -239,43 +248,47 @@ pub async fn candles(
         window.end.timestamp(),
         window.limit
     );
-    if let Some(value) = state.security_store.cache_get(&cache_key).await {
-        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
-    }
-
-    match db::get_candles(
-        &state.db,
-        &product_id,
-        &window.interval,
-        &window.metric,
-        window.start,
-        window.end,
-        window.limit,
+    let value = match cached_response(
+        state.get_ref(),
+        cache_key,
+        StdDuration::from_secs(30),
+        || async {
+            match db::get_candles(
+                &state.db,
+                &product_id,
+                &window.interval,
+                &window.metric,
+                window.start,
+                window.end,
+                window.limit,
+            )
+            .await
+            {
+                Ok(candle_rows) => {
+                    let points = candle_rows
+                        .into_iter()
+                        .map(|candle| candle_point(candle, &window.metric))
+                        .collect::<Vec<_>>();
+                    Ok(serde_json::to_value(ApiResponse::success(points))
+                        .unwrap_or_else(|_| json!({})))
+                }
+                Err(error) => {
+                    eprintln!("Candles query failed: {}", error);
+                    Err(security::problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "candles_query_failed",
+                        "Candles could not be loaded",
+                    ))
+                }
+            }
+        },
     )
     .await
     {
-        Ok(candle_rows) => {
-            let points = candle_rows
-                .into_iter()
-                .map(|candle| candle_point(candle, &window.metric))
-                .collect::<Vec<_>>();
-            let value =
-                serde_json::to_value(ApiResponse::success(points)).unwrap_or_else(|_| json!({}));
-            state
-                .security_store
-                .cache_set(cache_key, value.clone(), StdDuration::from_secs(30))
-                .await;
-            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
-        }
-        Err(error) => {
-            eprintln!("Candles query failed: {}", error);
-            security::problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "candles_query_failed",
-                "Candles could not be loaded",
-            )
-        }
-    }
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
 }
 
 #[get("/api/v2/skyblock/bazaar/products/{product_id}/series")]
@@ -314,43 +327,107 @@ pub async fn series(
         window.end.timestamp(),
         window.limit
     );
-    if let Some(value) = state.security_store.cache_get(&cache_key).await {
-        return security::with_auth_headers(HttpResponse::Ok().json(value), &auth);
-    }
-
-    match db::get_candles(
-        &state.db,
-        &product_id,
-        &window.interval,
-        &window.metric,
-        window.start,
-        window.end,
-        window.limit,
+    let value = match cached_response(
+        state.get_ref(),
+        cache_key,
+        StdDuration::from_secs(30),
+        || async {
+            match db::get_candles(
+                &state.db,
+                &product_id,
+                &window.interval,
+                &window.metric,
+                window.start,
+                window.end,
+                window.limit,
+            )
+            .await
+            {
+                Ok(candle_rows) => {
+                    let points = candle_rows
+                        .into_iter()
+                        .map(|candle| series_point(candle, &window.metric, stat))
+                        .collect::<Vec<_>>();
+                    Ok(serde_json::to_value(ApiResponse::success(points))
+                        .unwrap_or_else(|_| json!({})))
+                }
+                Err(error) => {
+                    eprintln!("Series query failed: {}", error);
+                    Err(security::problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "series_query_failed",
+                        "Series could not be loaded",
+                    ))
+                }
+            }
+        },
     )
     .await
     {
-        Ok(candle_rows) => {
-            let points = candle_rows
-                .into_iter()
-                .map(|candle| series_point(candle, &window.metric, stat))
-                .collect::<Vec<_>>();
-            let value =
-                serde_json::to_value(ApiResponse::success(points)).unwrap_or_else(|_| json!({}));
-            state
-                .security_store
-                .cache_set(cache_key, value.clone(), StdDuration::from_secs(30))
-                .await;
-            security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
-        }
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    security::with_auth_headers(HttpResponse::Ok().json(value), &auth)
+}
+
+async fn cached_response<F, Fut>(
+    state: &AppState,
+    cache_key: String,
+    ttl: StdDuration,
+    load: F,
+) -> Result<Value, HttpResponse>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Value, HttpResponse>>,
+{
+    if let Some(value) = state.security_store.cache_get(&cache_key).await {
+        return Ok(value);
+    }
+
+    let lock_key = format!("cache-fill:{}", cache_key);
+    let lock_token = match state
+        .security_store
+        .acquire_lock(&lock_key, StdDuration::from_secs(5))
+        .await
+    {
+        Ok(token) => token,
         Err(error) => {
-            eprintln!("Series query failed: {}", error);
-            security::problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "series_query_failed",
-                "Series could not be loaded",
-            )
+            eprintln!("Response cache fill lock failed: {}", error);
+            None
+        }
+    };
+
+    if lock_token.is_none() {
+        if let Some(value) = wait_for_cached_response(state, &cache_key).await {
+            return Ok(value);
         }
     }
+
+    let result = load().await;
+    if let Ok(value) = &result {
+        state
+            .security_store
+            .cache_set(cache_key, value.clone(), ttl)
+            .await;
+    }
+
+    if let Some(token) = lock_token {
+        if let Err(error) = state.security_store.release_lock(&lock_key, &token).await {
+            eprintln!("Response cache fill lock release failed: {}", error);
+        }
+    }
+
+    result
+}
+
+async fn wait_for_cached_response(state: &AppState, cache_key: &str) -> Option<Value> {
+    for _ in 0..20 {
+        tokio::time::sleep(StdDuration::from_millis(25)).await;
+        if let Some(value) = state.security_store.cache_get(cache_key).await {
+            return Some(value);
+        }
+    }
+    None
 }
 
 struct ChartWindow {

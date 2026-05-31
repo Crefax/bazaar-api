@@ -35,8 +35,8 @@ Invoke-RestMethod `
 Rate-limit headers:
 
 ```http
-X-RateLimit-Limit: 600
-X-RateLimit-Remaining: 599
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 999
 ```
 
 Daily quota headers appear when the key has a quota:
@@ -63,7 +63,7 @@ Invoke-RestMethod `
 $body = @{
   name = "Example Client"
   owner_email = "client@example.com"
-  rate_limit_per_minute = 600
+  rate_limit_per_minute = 1000
   daily_quota = 100000
 } | ConvertTo-Json
 

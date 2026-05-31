@@ -3,6 +3,7 @@
 use actix_cors::Cors;
 use actix_web::{App, HttpServer, middleware, web};
 use mongodb::Client;
+use std::path::{Path, PathBuf};
 
 mod api;
 mod config;
@@ -15,7 +16,17 @@ mod tracker;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    load_dotenv();
     let config = config::AppConfig::from_env();
+    println!(
+        "Runtime config: app_env={:?}, bind_addr={}, mongodb_db={}, admin_api_key_configured={}, redis_url_configured={}, redis_required={}",
+        config.app_env,
+        config.bind_addr,
+        config.mongodb_db,
+        config.admin_api_key.is_some(),
+        config.redis_url.is_some(),
+        config.redis_required()
+    );
 
     let client = Client::with_uri_str(&config.mongodb_uri)
         .await
@@ -66,18 +77,6 @@ async fn main() -> std::io::Result<()> {
             .wrap(middleware::Logger::default())
             .wrap(middleware::NormalizePath::trim())
             .wrap(default_headers)
-            .service(
-                web::scope("")
-                    .wrap(public_cors)
-                    .service(api::health)
-                    .service(api::ready)
-                    .service(api::openapi)
-                    .service(api::list_products)
-                    .service(api::latest_many)
-                    .service(api::latest_one)
-                    .service(api::candles)
-                    .service(api::series),
-            )
             .service(api::admin_panel)
             .service(api::login)
             .service(api::logout)
@@ -90,10 +89,51 @@ async fn main() -> std::io::Result<()> {
             .service(api::update_access_policy)
             .service(api::get_compression_stats_v2)
             .service(api::get_compression_logs_v2)
+            .service(
+                web::scope("")
+                    .wrap(public_cors)
+                    .service(api::health)
+                    .service(api::ready)
+                    .service(api::openapi)
+                    .service(api::list_products)
+                    .service(api::latest_many)
+                    .service(api::latest_one)
+                    .service(api::candles)
+                    .service(api::series),
+            )
     })
     .bind(bind_addr)?
     .run()
     .await
+}
+
+fn load_dotenv() {
+    if let Ok(path) = dotenvy::dotenv() {
+        println!("Loaded environment from {}", path.display());
+        return;
+    }
+
+    for path in dotenv_candidates_from_exe() {
+        if path.is_file() && dotenvy::from_path(&path).is_ok() {
+            println!("Loaded environment from {}", path.display());
+            return;
+        }
+    }
+
+    println!("No .env file found; using process environment and defaults");
+}
+
+fn dotenv_candidates_from_exe() -> Vec<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .map(|dir| {
+            dir.ancestors()
+                .take(4)
+                .map(|ancestor| ancestor.join(".env"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn build_public_cors(config: &config::AppConfig) -> Cors {
@@ -159,6 +199,24 @@ mod tests {
         let response = test::call_service(&app, request).await;
 
         assert_eq!(response.status(), actix_web::http::StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn admin_panel_is_not_shadowed_by_public_scope() {
+        let config = test_config();
+        let app = test::init_service(
+            App::new().service(api::admin_panel).service(
+                web::scope("")
+                    .wrap(build_public_cors(&config))
+                    .service(api::health),
+            ),
+        )
+        .await;
+
+        let request = test::TestRequest::get().uri("/admin").to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
 
     #[actix_web::test]

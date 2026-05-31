@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const ADMIN_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
-const MAX_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
+const MAX_RATE_LIMIT_PER_MINUTE: u32 = 10_000_000;
 const MAX_DAILY_QUOTA: u32 = 100_000_000;
 const ACCESS_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 const USER_KEY_SCOPE: &str = "bazaar:read";
@@ -277,6 +277,7 @@ pub async fn update_api_key(
 
     match db::update_api_key(&state.db, &id, update).await {
         Ok(Some(record)) => {
+            purge_api_key_record_cache(state.get_ref(), &record.key_prefix).await;
             HttpResponse::Ok().json(ApiResponse::success(ApiKeySummary::from(record)))
         }
         Ok(None) => security::problem(
@@ -305,12 +306,27 @@ pub async fn rotate_api_key(
         return response;
     }
 
+    let id = id.into_inner();
+    let old_prefix = match db::find_api_key_by_id(&state.db, &id).await {
+        Ok(record) => record.map(|record| record.key_prefix),
+        Err(error) => {
+            eprintln!("API key lookup before rotate failed: {}", error);
+            None
+        }
+    };
+
     let (plain_key, key_prefix, key_hash) = security::generate_user_api_key(&state.config);
     match db::rotate_api_key(&state.db, &id, key_prefix, key_hash).await {
-        Ok(Some(record)) => HttpResponse::Ok().json(ApiResponse::success(CreatedApiKey {
-            key: plain_key,
-            record: ApiKeySummary::from(record),
-        })),
+        Ok(Some(record)) => {
+            if let Some(prefix) = old_prefix.as_deref() {
+                purge_api_key_record_cache(state.get_ref(), prefix).await;
+            }
+            purge_api_key_record_cache(state.get_ref(), &record.key_prefix).await;
+            HttpResponse::Ok().json(ApiResponse::success(CreatedApiKey {
+                key: plain_key,
+                record: ApiKeySummary::from(record),
+            }))
+        }
         Ok(None) => security::problem(
             StatusCode::NOT_FOUND,
             "api_key_not_found",
@@ -339,6 +355,7 @@ pub async fn revoke_api_key(
 
     match db::revoke_api_key(&state.db, &id).await {
         Ok(Some(record)) => {
+            purge_api_key_record_cache(state.get_ref(), &record.key_prefix).await;
             HttpResponse::Ok().json(ApiResponse::success(ApiKeySummary::from(record)))
         }
         Ok(None) => security::problem(
@@ -556,6 +573,13 @@ fn validate_user_scopes(scopes: Option<&[String]>) -> Result<(), HttpResponse> {
     Ok(())
 }
 
+async fn purge_api_key_record_cache(state: &AppState, prefix: &str) {
+    state
+        .security_store
+        .cache_remove_prefix(&security::api_key_record_cache_key(prefix))
+        .await;
+}
+
 fn build_admin_cookie(
     state: &AppState,
     value: impl Into<String>,
@@ -622,7 +646,7 @@ const ADMIN_PANEL_HTML: &str = r#"<!doctype html>
     <div class="grid">
       <label>Name <input id="keyName"></label>
       <label>Owner email <input id="ownerEmail"></label>
-      <label>Rate limit/min <input id="keyLimit" type="number" min="1" placeholder="600"></label>
+      <label>Rate limit/min <input id="keyLimit" type="number" min="1" placeholder="1000"></label>
       <label>Daily quota <input id="dailyQuota" type="number" min="1"></label>
     </div>
     <button id="createKeyButton">Create Key</button>

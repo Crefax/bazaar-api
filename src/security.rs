@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::db;
-use crate::models::{AccessPolicy, ProblemResponse};
+use crate::models::{AccessPolicy, ApiKeyRecord, ProblemResponse};
 use crate::shared_store::{DailyQuotaOutcome, RateLimitOutcome};
 use crate::state::AppState;
 use actix_web::http::header::{HeaderName, HeaderValue};
@@ -21,6 +21,8 @@ pub const ADMIN_SESSION_COOKIE: &str = "bazaar_admin_session";
 pub const SECURE_ADMIN_SESSION_COOKIE: &str = "__Host-bazaar_admin_session";
 
 const ACCESS_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
+const API_KEY_RECORD_CACHE_TTL: Duration = Duration::from_secs(30);
+const API_KEY_LAST_USED_TOUCH_TTL: Duration = Duration::from_secs(60);
 const ADMIN_LOGIN_MINUTE_LIMIT: u32 = 5;
 const ADMIN_LOGIN_HOUR_LIMIT: u32 = 50;
 const ADMIN_API_RATE_LIMIT: u32 = 120;
@@ -167,23 +169,7 @@ pub async fn authorize_public(
                 "Invalid API key format",
             )
         })?;
-        let record = db::find_api_key_by_prefix(&state.db, prefix)
-            .await
-            .map_err(|error| {
-                eprintln!("API key lookup failed: {}", error);
-                problem(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_key_lookup_error",
-                    "API key could not be verified",
-                )
-            })?
-            .ok_or_else(|| {
-                problem(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_api_key",
-                    "Invalid API key",
-                )
-            })?;
+        let record = load_api_key_record(state, prefix).await?;
 
         let id = record.id.as_ref().map(|id| id.to_hex()).unwrap_or_default();
         match verify_api_key_hash(&record.key_hash, raw_key, &state.config) {
@@ -192,6 +178,11 @@ pub async fn authorize_public(
                 let new_hash = hash_api_key(raw_key, &state.config);
                 if let Err(error) = db::update_api_key_hash(&state.db, &id, new_hash).await {
                     eprintln!("API key hash migration failed for {}: {}", id, error);
+                } else {
+                    state
+                        .security_store
+                        .cache_remove_prefix(&api_key_record_cache_key(prefix))
+                        .await;
                 }
             }
             ApiKeyHashStatus::Invalid => {
@@ -263,7 +254,7 @@ pub async fn authorize_public(
             None
         };
 
-        let _ = db::touch_api_key_last_used(&state.db, &id).await;
+        touch_api_key_last_used_throttled(state, &id).await;
         return Ok(RequestAuth {
             rate_limit,
             daily_quota,
@@ -302,6 +293,103 @@ pub async fn authorize_public(
         rate_limit,
         daily_quota: None,
     })
+}
+
+async fn load_api_key_record(state: &AppState, prefix: &str) -> Result<ApiKeyRecord, HttpResponse> {
+    let cache_key = api_key_record_cache_key(prefix);
+    if let Some(record) = cached_api_key_record(state, &cache_key).await {
+        return Ok(record);
+    }
+
+    let lock_key = format!("api-key-record-fill:{}", prefix);
+    let lock_token = match state
+        .security_store
+        .acquire_lock(&lock_key, Duration::from_secs(5))
+        .await
+    {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("API key record cache fill lock failed: {}", error);
+            None
+        }
+    };
+
+    if lock_token.is_none() {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(record) = cached_api_key_record(state, &cache_key).await {
+                return Ok(record);
+            }
+        }
+    }
+
+    let result = match db::find_api_key_by_prefix(&state.db, prefix).await {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err(problem(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid API key",
+        )),
+        Err(error) => {
+            eprintln!("API key lookup failed: {}", error);
+            Err(problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_key_lookup_error",
+                "API key could not be verified",
+            ))
+        }
+    };
+
+    if let Some(token) = lock_token {
+        if let Err(error) = state.security_store.release_lock(&lock_key, &token).await {
+            eprintln!("API key record cache fill lock release failed: {}", error);
+        }
+    }
+
+    if let Ok(record) = &result
+        && let Ok(value) = serde_json::to_value(record)
+    {
+        state
+            .security_store
+            .cache_set(cache_key, value, API_KEY_RECORD_CACHE_TTL)
+            .await;
+    }
+
+    result
+}
+
+async fn cached_api_key_record(state: &AppState, cache_key: &str) -> Option<ApiKeyRecord> {
+    match state.security_store.cache_get(cache_key).await {
+        Some(value) => match serde_json::from_value::<ApiKeyRecord>(value) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                eprintln!("Cached API key record parse failed: {}", error);
+                None
+            }
+        },
+        None => None,
+    }
+}
+
+async fn touch_api_key_last_used_throttled(state: &AppState, id: &str) {
+    let lock_key = format!("api-key-last-used:{}", id);
+    match state
+        .security_store
+        .acquire_lock(&lock_key, API_KEY_LAST_USED_TOUCH_TTL)
+        .await
+    {
+        Ok(Some(_token)) => {
+            if let Err(error) = db::touch_api_key_last_used(&state.db, id).await {
+                eprintln!("API key last_used_at update failed for {}: {}", id, error);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("API key last_used_at throttle failed: {}", error),
+    }
+}
+
+pub fn api_key_record_cache_key(prefix: &str) -> String {
+    format!("api-key-record:{}", prefix)
 }
 
 pub async fn check_admin_login_rate_limit(

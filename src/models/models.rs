@@ -239,7 +239,7 @@ impl Default for AccessPolicy {
             id: "public_api".to_string(),
             anonymous_public_enabled: true,
             anonymous_rate_limit_per_minute: 120,
-            default_user_rate_limit_per_minute: 600,
+            default_user_rate_limit_per_minute: 1_000,
             updated_at: Utc::now(),
         }
     }
