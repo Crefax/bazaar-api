@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::db;
 use crate::models::{AccessPolicy, ApiKeyRecord, ProblemResponse};
 use crate::shared_store::{DailyQuotaOutcome, RateLimitOutcome};
-use crate::state::AppState;
+use crate::state::{AppState, VerifiedApiKey};
 use actix_web::http::header::{HeaderName, HeaderValue};
 use actix_web::http::{Method, StatusCode};
 use actix_web::{HttpRequest, HttpResponse};
@@ -23,6 +23,7 @@ pub const SECURE_ADMIN_SESSION_COOKIE: &str = "__Host-bazaar_admin_session";
 
 const ACCESS_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 const API_KEY_RECORD_CACHE_TTL: Duration = Duration::from_secs(30);
+const API_KEY_VERIFICATION_CACHE_TTL: Duration = Duration::from_secs(2);
 const API_KEY_LAST_USED_TOUCH_TTL: Duration = Duration::from_secs(60);
 const ADMIN_LOGIN_MINUTE_LIMIT: u32 = 5;
 const ADMIN_LOGIN_HOUR_LIMIT: u32 = 50;
@@ -147,8 +148,6 @@ pub async fn authorize_public(
     state: &AppState,
     required_scope: &str,
 ) -> Result<RequestAuth, HttpResponse> {
-    let policy = load_access_policy(state).await?;
-
     if let Some(raw_key) = header_value(req, USER_API_KEY_HEADER) {
         if state
             .config
@@ -163,56 +162,22 @@ pub async fn authorize_public(
             ));
         }
 
-        let prefix = parse_api_key_prefix(raw_key).ok_or_else(|| {
-            problem(
-                StatusCode::UNAUTHORIZED,
-                "invalid_api_key",
-                "Invalid API key format",
-            )
-        })?;
-        let record = load_api_key_record(state, prefix).await?;
+        let verified = load_verified_api_key(state, raw_key).await?;
 
-        let id = record.id.as_ref().map(|id| id.to_hex()).unwrap_or_default();
-        match verify_api_key_hash(&record.key_hash, raw_key, &state.config) {
-            ApiKeyHashStatus::Current => {}
-            ApiKeyHashStatus::Legacy => {
-                let new_hash = hash_api_key(raw_key, &state.config);
-                if let Err(error) = db::update_api_key_hash(&state.db, &id, new_hash).await {
-                    eprintln!("API key hash migration failed for {}: {}", id, error);
-                } else {
-                    state
-                        .security_store
-                        .cache_remove_prefix(&api_key_record_cache_key(prefix))
-                        .await;
-                }
-            }
-            ApiKeyHashStatus::Invalid => {
-                return Err(problem(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_api_key",
-                    "Invalid API key",
-                ));
-            }
-        }
-
-        if record.status != "active" {
-            return Err(problem(
-                StatusCode::FORBIDDEN,
-                "api_key_disabled",
-                "API key is not active",
-            ));
-        }
-        if record
+        if verified
             .expires_at
             .is_some_and(|expires_at| expires_at <= Utc::now())
         {
+            state
+                .remove_verified_api_key_cache_prefix(&verified.key_prefix)
+                .await;
             return Err(problem(
                 StatusCode::FORBIDDEN,
                 "api_key_expired",
                 "API key has expired",
             ));
         }
-        if !record.scopes.iter().any(|scope| scope == required_scope) {
+        if !verified.scopes.iter().any(|scope| scope == required_scope) {
             return Err(problem(
                 StatusCode::FORBIDDEN,
                 "scope_denied",
@@ -222,8 +187,8 @@ pub async fn authorize_public(
 
         let rate_limit = check_rate_limit_or_503(
             state,
-            &format!("api-key:{}", id),
-            record.rate_limit_per_minute,
+            &format!("api-key:{}", verified.id),
+            verified.rate_limit_per_minute,
             Duration::from_secs(60),
         )
         .await?;
@@ -238,8 +203,9 @@ pub async fn authorize_public(
             ));
         }
 
-        let daily_quota = if let Some(limit) = record.daily_quota {
-            let quota = check_daily_quota_or_503(state, &format!("api-key:{}", id), limit).await?;
+        let daily_quota = if let Some(limit) = verified.daily_quota {
+            let quota =
+                check_daily_quota_or_503(state, &format!("api-key:{}", verified.id), limit).await?;
             if !quota.allowed {
                 return Err(with_daily_quota_headers(
                     problem(
@@ -255,13 +221,14 @@ pub async fn authorize_public(
             None
         };
 
-        schedule_api_key_last_used_touch(state, &id).await;
+        schedule_api_key_last_used_touch(state, &verified.id).await;
         return Ok(RequestAuth {
             rate_limit,
             daily_quota,
         });
     }
 
+    let policy = load_access_policy(state).await?;
     if !policy.anonymous_public_enabled {
         return Err(problem(
             StatusCode::UNAUTHORIZED,
@@ -294,6 +261,83 @@ pub async fn authorize_public(
         rate_limit,
         daily_quota: None,
     })
+}
+
+async fn load_verified_api_key(
+    state: &AppState,
+    raw_key: &str,
+) -> Result<VerifiedApiKey, HttpResponse> {
+    if let Some(verified) = state.cached_verified_api_key(raw_key).await {
+        return Ok(verified);
+    }
+
+    let prefix = parse_api_key_prefix(raw_key).ok_or_else(|| {
+        problem(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid API key format",
+        )
+    })?;
+    let record = load_api_key_record(state, prefix).await?;
+
+    let id = record.id.as_ref().map(|id| id.to_hex()).unwrap_or_default();
+    match verify_api_key_hash(&record.key_hash, raw_key, &state.config) {
+        ApiKeyHashStatus::Current => {}
+        ApiKeyHashStatus::Legacy => {
+            let new_hash = hash_api_key(raw_key, &state.config);
+            if let Err(error) = db::update_api_key_hash(&state.db, &id, new_hash).await {
+                eprintln!("API key hash migration failed for {}: {}", id, error);
+            } else {
+                state
+                    .security_store
+                    .cache_remove_prefix(&api_key_record_cache_key(prefix))
+                    .await;
+                state.remove_verified_api_key_cache_prefix(prefix).await;
+            }
+        }
+        ApiKeyHashStatus::Invalid => {
+            return Err(problem(
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                "Invalid API key",
+            ));
+        }
+    }
+
+    if record.status != "active" {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "api_key_disabled",
+            "API key is not active",
+        ));
+    }
+    if record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+    {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "api_key_expired",
+            "API key has expired",
+        ));
+    }
+
+    let verified = VerifiedApiKey {
+        id,
+        key_prefix: record.key_prefix,
+        scopes: record.scopes,
+        rate_limit_per_minute: record.rate_limit_per_minute,
+        daily_quota: record.daily_quota,
+        expires_at: record.expires_at,
+    };
+    state
+        .cache_verified_api_key(
+            raw_key.to_string(),
+            verified.clone(),
+            API_KEY_VERIFICATION_CACHE_TTL,
+        )
+        .await;
+    Ok(verified)
 }
 
 async fn load_api_key_record(state: &AppState, prefix: &str) -> Result<ApiKeyRecord, HttpResponse> {
@@ -374,7 +418,17 @@ async fn cached_api_key_record(state: &AppState, cache_key: &str) -> Option<ApiK
 
 async fn schedule_api_key_last_used_touch(state: &AppState, id: &str) {
     let now = Instant::now();
-    let mut timestamps = state.api_key_last_used_timestamps.lock().await;
+    {
+        let timestamps = state.api_key_last_used_timestamps.read().await;
+        if timestamps
+            .get(id)
+            .is_some_and(|last_touch| now.duration_since(*last_touch) < API_KEY_LAST_USED_TOUCH_TTL)
+        {
+            return;
+        }
+    }
+
+    let mut timestamps = state.api_key_last_used_timestamps.write().await;
     if !should_touch_api_key_last_used(&mut timestamps, id, now) {
         return;
     }
@@ -768,7 +822,7 @@ mod tests {
             admin_cookie_secure: false,
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
-            rate_limit_reservation_size: 64,
+            rate_limit_reservation_size: 128,
             admin_json_limit_bytes: 16 * 1024,
             request_logging: false,
             response_compression: false,

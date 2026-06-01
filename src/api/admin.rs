@@ -574,6 +574,7 @@ fn validate_user_scopes(scopes: Option<&[String]>) -> Result<(), HttpResponse> {
 }
 
 async fn purge_api_key_record_cache(state: &AppState, prefix: &str) {
+    state.remove_verified_api_key_cache_prefix(prefix).await;
     state
         .security_store
         .cache_remove_prefix(&security::api_key_record_cache_key(prefix))

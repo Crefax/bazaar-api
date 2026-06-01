@@ -71,14 +71,9 @@ cargo build --release
 ./target/release/bazaar-api
 ```
 
-The checked-in release profile uses `opt-level=3`, Thin LTO, one codegen unit, and symbol stripping. `simd-json` keeps runtime detection enabled, so portable release binaries select AVX2/SSE4.2 on x86 and NEON on aarch64 when available.
-
-Optional native-only build for a binary that will run on the same CPU family it was built on:
-
-```powershell
-$env:RUSTFLAGS="-C target-cpu=native"
-cargo build --release
-```
+The checked-in release settings use `opt-level=3`, Thin LTO, one codegen unit,
+`panic = "abort"`, symbol stripping, and `target-cpu=native` via Cargo
+rustflags. Build release binaries on the same CPU family they will run on.
 
 Environment variables:
 
@@ -98,7 +93,7 @@ Environment variables:
 | `ADMIN_COOKIE_SECURE` | env-based | Defaults to true in production and false in development. |
 | `CACHE_MAX_ENTRIES` | `10000` | Bounded local cache entries for development fallback. |
 | `RATE_LIMIT_MAX_KEYS` | `50000` | Bounded local rate/quota keys for development fallback. |
-| `RATE_LIMIT_RESERVATION_SIZE` | `64` | API-key rate limit batch size before syncing to Redis. Set `1` for exact per-request Redis checks. Batching favors users: unsynced local requests can become extra allowance, not early loss. |
+| `RATE_LIMIT_RESERVATION_SIZE` | `128` | API-key rate limit batch size before syncing to Redis. Set `1` for exact per-request Redis checks. Batching favors users: unsynced local requests can become extra allowance, not early loss. |
 | `ADMIN_JSON_LIMIT_BYTES` | `16384` | JSON payload limit. |
 | `REQUEST_LOGGING` | env-based | Defaults to true in development and false in production. Disable for benchmarks. |
 | `RESPONSE_COMPRESSION` | env-based | Defaults to true in development and false in production. Keep off when Cloudflare/edge compression handles gzip. |

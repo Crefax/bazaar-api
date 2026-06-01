@@ -81,7 +81,7 @@ impl AppConfig {
             admin_cookie_secure,
             cache_max_entries: parse_usize_env("CACHE_MAX_ENTRIES", 10_000),
             rate_limit_max_keys: parse_usize_env("RATE_LIMIT_MAX_KEYS", 50_000),
-            rate_limit_reservation_size: parse_u32_env("RATE_LIMIT_RESERVATION_SIZE", 64),
+            rate_limit_reservation_size: parse_u32_env("RATE_LIMIT_RESERVATION_SIZE", 128),
             admin_json_limit_bytes: parse_usize_env("ADMIN_JSON_LIMIT_BYTES", 16 * 1024),
             request_logging: env::var("REQUEST_LOGGING")
                 .ok()

@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
@@ -94,9 +94,21 @@ struct RateLimitReservation {
     expires_at: Instant,
     blocked: bool,
     limit: u32,
+    refill_lock: Arc<Mutex<()>>,
 }
 
 impl RateLimitReservation {
+    fn placeholder(now: Instant, limit: u32) -> Self {
+        Self {
+            pending: 0,
+            known_remaining: 0,
+            expires_at: now,
+            blocked: false,
+            limit,
+            refill_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
     fn try_consume_local(&mut self, now: Instant, batch_size: u32) -> Option<RateLimitOutcome> {
         if self.expires_at <= now {
             return None;
@@ -160,7 +172,7 @@ type StoreResult<T> = Result<T, SecurityStoreError>;
 pub struct SharedSecurityStore {
     redis: Option<RedisSecurityStore>,
     memory: Arc<MemorySecurityStore>,
-    rate_limit_reservations: Arc<Mutex<HashMap<String, RateLimitReservation>>>,
+    rate_limit_reservations: Arc<StdMutex<HashMap<String, RateLimitReservation>>>,
     rate_limit_reservation_size: u32,
     max_rate_keys: usize,
     redis_required: bool,
@@ -173,7 +185,7 @@ impl SharedSecurityStore {
             config.cache_max_entries,
             config.rate_limit_max_keys,
         ));
-        let rate_limit_reservations = Arc::new(Mutex::new(HashMap::new()));
+        let rate_limit_reservations = Arc::new(StdMutex::new(HashMap::new()));
         let redis_required = config.redis_required();
 
         if let Some(redis_url) = &config.redis_url {
@@ -236,6 +248,12 @@ impl SharedSecurityStore {
         self.redis_init_error.as_deref()
     }
 
+    fn rate_limit_reservations(&self) -> StdMutexGuard<'_, HashMap<String, RateLimitReservation>> {
+        self.rate_limit_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub async fn check_rate_limit(
         &self,
         key: &str,
@@ -280,37 +298,115 @@ impl SharedSecurityStore {
 
         let now = Instant::now();
         let reservation_key = rate_reservation_key(key, limit, window);
-        let mut reservations = self.rate_limit_reservations.lock().await;
-        reservations.retain(|_, entry| entry.expires_at > now);
+        let refill_lock = {
+            let mut reservations = self.rate_limit_reservations();
+            if reservations
+                .get(&reservation_key)
+                .is_some_and(|entry| entry.expires_at <= now)
+            {
+                reservations.remove(&reservation_key);
+            }
 
-        if let Some(entry) = reservations.get_mut(&reservation_key)
-            && let Some(outcome) = entry.try_consume_local(now, batch_size)
-        {
-            return Ok(outcome);
-        }
+            if let Some(entry) = reservations.get_mut(&reservation_key)
+                && let Some(outcome) = entry.try_consume_local(now, batch_size)
+            {
+                return Ok(outcome);
+            }
 
-        if !reservations.contains_key(&reservation_key) && reservations.len() >= self.max_rate_keys
-        {
+            if !reservations.contains_key(&reservation_key)
+                && reservations.len() >= self.max_rate_keys
+            {
+                reservations.retain(|_, entry| entry.expires_at > now);
+                if !reservations.contains_key(&reservation_key)
+                    && reservations.len() >= self.max_rate_keys
+                {
+                    None
+                } else {
+                    Some(
+                        reservations
+                            .entry(reservation_key.clone())
+                            .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
+                            .refill_lock
+                            .clone(),
+                    )
+                }
+            } else {
+                Some(
+                    reservations
+                        .entry(reservation_key.clone())
+                        .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
+                        .refill_lock
+                        .clone(),
+                )
+            }
+        };
+
+        let Some(refill_lock) = refill_lock else {
             return redis.check_rate_limit(key, limit, window).await;
-        }
+        };
 
-        let pending = reservations
-            .get(&reservation_key)
-            .map(|entry| entry.pending)
-            .unwrap_or(0);
-        let amount = pending.saturating_add(1);
+        let _refill_guard = refill_lock.lock().await;
+        let now = Instant::now();
+        let amount = {
+            let mut reservations = self.rate_limit_reservations();
+            if reservations
+                .get(&reservation_key)
+                .is_some_and(|entry| entry.expires_at <= now)
+            {
+                reservations.remove(&reservation_key);
+            }
+
+            if let Some(entry) = reservations.get_mut(&reservation_key)
+                && let Some(outcome) = entry.try_consume_local(now, batch_size)
+            {
+                return Ok(outcome);
+            }
+
+            if !reservations.contains_key(&reservation_key)
+                && reservations.len() >= self.max_rate_keys
+            {
+                reservations.retain(|_, entry| entry.expires_at > now);
+                if !reservations.contains_key(&reservation_key)
+                    && reservations.len() >= self.max_rate_keys
+                {
+                    None
+                } else {
+                    Some(
+                        reservations
+                            .entry(reservation_key.clone())
+                            .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
+                            .pending
+                            .saturating_add(1),
+                    )
+                }
+            } else {
+                Some(
+                    reservations
+                        .entry(reservation_key.clone())
+                        .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
+                        .pending
+                        .saturating_add(1),
+                )
+            }
+        };
+
+        let Some(amount) = amount else {
+            return redis.check_rate_limit(key, limit, window).await;
+        };
         let outcome = match redis
             .check_rate_limit_batch(key, limit, window, amount)
             .await
         {
             Ok(outcome) => outcome,
             Err(error) => {
+                let mut reservations = self.rate_limit_reservations();
                 reservations.remove(&reservation_key);
                 return Err(error);
             }
         };
 
         let expires_at = Instant::now() + Duration::from_secs(outcome.retry_after_seconds.max(1));
+        let mut reservations = self.rate_limit_reservations();
         reservations.insert(
             reservation_key,
             RateLimitReservation {
@@ -319,6 +415,7 @@ impl SharedSecurityStore {
                 expires_at,
                 blocked: !outcome.allowed,
                 limit: outcome.limit,
+                refill_lock: refill_lock.clone(),
             },
         );
 
@@ -1252,6 +1349,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Mutex;
 
     fn test_config() -> Arc<AppConfig> {
         Arc::new(AppConfig {
@@ -1269,7 +1367,7 @@ mod tests {
             admin_cookie_secure: false,
             cache_max_entries: 10,
             rate_limit_max_keys: 10,
-            rate_limit_reservation_size: 64,
+            rate_limit_reservation_size: 128,
             admin_json_limit_bytes: 16 * 1024,
             request_logging: false,
             response_compression: false,
@@ -1399,6 +1497,7 @@ mod tests {
             expires_at: now + Duration::from_secs(60),
             blocked: false,
             limit: 1000,
+            refill_lock: Arc::new(Mutex::new(())),
         };
 
         for expected_pending in 1..=63 {
