@@ -16,6 +16,7 @@ use std::time::Duration as StdDuration;
 
 const BAZAAR_READ_SCOPE: &str = "bazaar:read";
 const PUBLIC_CACHE_VERSION: &str = "v3";
+const RAW_CACHE_REFRESH_COOLDOWN: StdDuration = StdDuration::from_millis(250);
 
 #[get("/health")]
 pub async fn health() -> impl Responder {
@@ -106,6 +107,7 @@ pub async fn list_products(req: HttpRequest, state: web::Data<AppState>) -> impl
         app_state.clone(),
         cache_key,
         StdDuration::from_secs(15),
+        false,
         move || {
             let app_state = app_state.clone();
             async move {
@@ -143,12 +145,14 @@ pub async fn latest_many(
     };
 
     let ids = parse_ids(query.ids.as_deref());
+    let prefer_large_raw_cache = ids.is_empty();
     let app_state = state.get_ref().clone();
     let cache_key = latest_many_cache_key(&ids);
     let raw = match cached_raw_response(
         app_state.clone(),
         cache_key,
         StdDuration::from_secs(15),
+        prefer_large_raw_cache,
         move || {
             let app_state = app_state.clone();
             let ids = ids.clone();
@@ -201,6 +205,7 @@ pub async fn latest_one(
         app_state.clone(),
         cache_key,
         StdDuration::from_secs(15),
+        false,
         move || {
             let app_state = app_state.clone();
             let product_id = product_id.clone();
@@ -264,6 +269,7 @@ pub async fn candles(
         app_state.clone(),
         cache_key,
         StdDuration::from_secs(30),
+        false,
         move || {
             let app_state = app_state.clone();
             let product_id = product_id.clone();
@@ -348,6 +354,7 @@ pub async fn series(
         app_state.clone(),
         cache_key,
         StdDuration::from_secs(30),
+        false,
         move || {
             let app_state = app_state.clone();
             let product_id = product_id.clone();
@@ -396,14 +403,21 @@ async fn cached_raw_response<F, Fut>(
     state: AppState,
     cache_key: String,
     ttl: StdDuration,
+    prefer_large_raw_cache: bool,
     load: F,
 ) -> Result<Bytes, RawCacheLoadError>
 where
     F: Fn() -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<Bytes, RawCacheLoadError>> + Send + 'static,
 {
-    if let Some(hit) = state.security_store.raw_cache_get(&cache_key).await {
-        if hit.is_stale() {
+    if let Some(hit) = state
+        .security_store
+        .raw_cache_get_with_hint(&cache_key, prefer_large_raw_cache)
+        .await
+    {
+        if hit.is_stale()
+            && state.try_start_raw_cache_refresh(&cache_key, RAW_CACHE_REFRESH_COOLDOWN)
+        {
             spawn_raw_cache_refresh(state, cache_key, ttl, load);
         }
         return Ok(hit.value);

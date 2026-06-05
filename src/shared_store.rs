@@ -15,6 +15,7 @@ const REDIS_KEY_PREFIX: &str = "bazaar-api:";
 const TYPED_L1_CACHE_TTL: Duration = Duration::from_secs(2);
 const RAW_L1_FRESH_TTL: Duration = Duration::from_secs(1);
 const RAW_L1_STALE_TTL: Duration = Duration::from_secs(30);
+const SMALL_RAW_L1_MAX_BYTES: usize = 64 * 1024;
 const LUA_RATE_LIMITER: &str = r#"
 local key = KEYS[1]
 local window = tonumber(ARGV[1])
@@ -495,7 +496,19 @@ impl SharedSecurityStore {
     }
 
     pub async fn raw_cache_get(&self, key: &str) -> Option<RawCacheHit> {
-        if let Some(hit) = self.memory.raw_cache_get(key).await {
+        self.raw_cache_get_with_hint(key, false).await
+    }
+
+    pub async fn raw_cache_get_with_hint(
+        &self,
+        key: &str,
+        prefer_large_value: bool,
+    ) -> Option<RawCacheHit> {
+        if let Some(hit) = self
+            .memory
+            .raw_cache_get_with_hint(key, prefer_large_value)
+            .await
+        {
             return Some(hit);
         }
 
@@ -970,7 +983,8 @@ struct MemorySecurityStore {
     rate_windows: Mutex<HashMap<String, MemoryRateWindow>>,
     daily_quotas: Mutex<HashMap<String, MemoryDailyQuota>>,
     cache_entries: Mutex<HashMap<String, MemoryCacheEntry>>,
-    raw_cache_entries: Mutex<HashMap<String, MemoryRawCacheEntry>>,
+    small_raw_cache_entries: RwLock<HashMap<String, MemoryRawCacheEntry>>,
+    large_raw_cache_entries: Mutex<HashMap<String, MemoryRawCacheEntry>>,
     policy: RwLock<Option<MemoryAccessPolicyEntry>>,
     admin_sessions: Mutex<HashMap<String, MemoryAdminSession>>,
     locks: Mutex<HashMap<String, MemoryLockEntry>>,
@@ -984,7 +998,8 @@ impl MemorySecurityStore {
             rate_windows: Mutex::new(HashMap::new()),
             daily_quotas: Mutex::new(HashMap::new()),
             cache_entries: Mutex::new(HashMap::new()),
-            raw_cache_entries: Mutex::new(HashMap::new()),
+            small_raw_cache_entries: RwLock::new(HashMap::new()),
+            large_raw_cache_entries: Mutex::new(HashMap::new()),
             policy: RwLock::new(None),
             admin_sessions: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
@@ -1115,23 +1130,57 @@ impl MemorySecurityStore {
         entries.retain(|key, _| !key.starts_with(prefix));
     }
 
-    async fn raw_cache_get(&self, key: &str) -> Option<RawCacheHit> {
+    async fn raw_cache_get_with_hint(
+        &self,
+        key: &str,
+        prefer_large_value: bool,
+    ) -> Option<RawCacheHit> {
+        if prefer_large_value {
+            if let Some(hit) = self.large_raw_cache_get(key).await {
+                return Some(hit);
+            }
+            return self.small_raw_cache_get(key).await;
+        }
+
+        if let Some(hit) = self.small_raw_cache_get(key).await {
+            return Some(hit);
+        }
+        self.large_raw_cache_get(key).await
+    }
+
+    async fn small_raw_cache_get(&self, key: &str) -> Option<RawCacheHit> {
         let now = Instant::now();
-        let mut entries = self.raw_cache_entries.lock().await;
-        match entries.get(key) {
-            Some(entry) if entry.fresh_expires_at > now => Some(RawCacheHit {
-                value: entry.value.clone(),
-                state: RawCacheState::Fresh,
-            }),
-            Some(entry) if entry.stale_expires_at > now => Some(RawCacheHit {
-                value: entry.value.clone(),
-                state: RawCacheState::Stale,
-            }),
-            Some(_) => {
+        {
+            let entries = self.small_raw_cache_entries.read().await;
+            match entries.get(key).and_then(|entry| raw_cache_hit(entry, now)) {
+                Some(hit) => return Some(hit),
+                None if !entries.contains_key(key) => {}
+                None => {
+                    drop(entries);
+                    let mut entries = self.small_raw_cache_entries.write().await;
+                    if entries
+                        .get(key)
+                        .is_some_and(|entry| entry.stale_expires_at <= now)
+                    {
+                        entries.remove(key);
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    async fn large_raw_cache_get(&self, key: &str) -> Option<RawCacheHit> {
+        let now = Instant::now();
+        let mut entries = self.large_raw_cache_entries.lock().await;
+        match entries.get(key).and_then(|entry| raw_cache_hit(entry, now)) {
+            Some(hit) => Some(hit),
+            None if !entries.contains_key(key) => None,
+            None => {
                 entries.remove(key);
                 None
             }
-            None => None,
         }
     }
 
@@ -1142,31 +1191,43 @@ impl MemorySecurityStore {
         fresh_ttl: Duration,
         stale_ttl: Duration,
     ) {
-        let now = Instant::now();
-        let mut entries = self.raw_cache_entries.lock().await;
-        entries.retain(|_, entry| entry.stale_expires_at > now);
-        if !entries.contains_key(&key) && entries.len() >= self.max_cache_entries {
-            if let Some(oldest_key) = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.inserted_at)
-                .map(|(key, _)| key.clone())
+        if value.len() <= SMALL_RAW_L1_MAX_BYTES {
             {
-                entries.remove(&oldest_key);
+                let mut entries = self.large_raw_cache_entries.lock().await;
+                entries.remove(&key);
             }
-        }
-        entries.insert(
-            key,
-            MemoryRawCacheEntry {
-                inserted_at: now,
-                fresh_expires_at: now + fresh_ttl,
-                stale_expires_at: now + stale_ttl.max(fresh_ttl),
+            let mut entries = self.small_raw_cache_entries.write().await;
+            insert_raw_cache_entry(
+                &mut entries,
+                self.max_cache_entries,
+                key,
                 value,
-            },
-        );
+                fresh_ttl,
+                stale_ttl,
+            );
+        } else {
+            {
+                let mut entries = self.small_raw_cache_entries.write().await;
+                entries.remove(&key);
+            }
+            let mut entries = self.large_raw_cache_entries.lock().await;
+            insert_raw_cache_entry(
+                &mut entries,
+                self.max_cache_entries,
+                key,
+                value,
+                fresh_ttl,
+                stale_ttl,
+            );
+        }
     }
 
     async fn raw_cache_remove_prefix(&self, prefix: &str) {
-        let mut entries = self.raw_cache_entries.lock().await;
+        {
+            let mut entries = self.small_raw_cache_entries.write().await;
+            entries.retain(|key, _| !key.starts_with(prefix));
+        }
+        let mut entries = self.large_raw_cache_entries.lock().await;
         entries.retain(|key, _| !key.starts_with(prefix));
     }
 
@@ -1289,6 +1350,52 @@ struct MemoryLockEntry {
     expires_at: Instant,
 }
 
+fn raw_cache_hit(entry: &MemoryRawCacheEntry, now: Instant) -> Option<RawCacheHit> {
+    if entry.fresh_expires_at > now {
+        return Some(RawCacheHit {
+            value: entry.value.clone(),
+            state: RawCacheState::Fresh,
+        });
+    }
+    if entry.stale_expires_at > now {
+        return Some(RawCacheHit {
+            value: entry.value.clone(),
+            state: RawCacheState::Stale,
+        });
+    }
+    None
+}
+
+fn insert_raw_cache_entry(
+    entries: &mut HashMap<String, MemoryRawCacheEntry>,
+    max_entries: usize,
+    key: String,
+    value: Bytes,
+    fresh_ttl: Duration,
+    stale_ttl: Duration,
+) {
+    let now = Instant::now();
+    entries.retain(|_, entry| entry.stale_expires_at > now);
+    if !entries.contains_key(&key) && entries.len() >= max_entries {
+        if let Some(oldest_key) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.inserted_at)
+            .map(|(key, _)| key.clone())
+        {
+            entries.remove(&oldest_key);
+        }
+    }
+    entries.insert(
+        key,
+        MemoryRawCacheEntry {
+            inserted_at: now,
+            fresh_expires_at: now + fresh_ttl,
+            stale_expires_at: now + stale_ttl.max(fresh_ttl),
+            value,
+        },
+    );
+}
+
 fn redis_key(suffix: &str) -> String {
     format!("{}{}", REDIS_KEY_PREFIX, suffix)
 }
@@ -1343,7 +1450,10 @@ fn parse_json<T: DeserializeOwned>(raw: String) -> Option<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LUA_DAILY_QUOTA, LUA_RATE_LIMITER, RawCacheState, SharedSecurityStore};
+    use super::{
+        LUA_DAILY_QUOTA, LUA_RATE_LIMITER, RawCacheState, SMALL_RAW_L1_MAX_BYTES,
+        SharedSecurityStore,
+    };
     use crate::config::{AppConfig, AppEnvironment};
     use bytes::Bytes;
     use serde_json::json;
@@ -1474,11 +1584,19 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await;
+        store
+            .raw_cache_set(
+                "prefix:large-raw",
+                Bytes::from(vec![b'a'; SMALL_RAW_L1_MAX_BYTES + 1]),
+                Duration::from_secs(60),
+            )
+            .await;
 
         store.cache_remove_prefix("prefix:").await;
 
         assert!(store.cache_get("prefix:typed").await.is_none());
         assert!(store.raw_cache_get("prefix:raw").await.is_none());
+        assert!(store.raw_cache_get("prefix:large-raw").await.is_none());
     }
 
     #[test]

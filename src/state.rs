@@ -4,7 +4,7 @@ use crate::shared_store::SharedSecurityStore;
 use chrono::{DateTime, Utc};
 use mongodb::Database;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -27,6 +27,7 @@ pub struct AppState {
     pub last_snapshot: Arc<RwLock<HashMap<String, ProductSnapshot>>>,
     pub latest_cache: Arc<RwLock<HashMap<String, BazaarLatest>>>,
     verified_api_key_cache: Arc<RwLock<HashMap<String, CachedVerifiedApiKey>>>,
+    raw_cache_refresh_deadlines: Arc<StdMutex<HashMap<String, Instant>>>,
     pub api_key_last_used_timestamps: Arc<RwLock<HashMap<String, Instant>>>,
     pub hypixel_last_modified: Arc<RwLock<Option<String>>>,
     pub hypixel_last_updated: Arc<RwLock<Option<i64>>>,
@@ -54,6 +55,7 @@ impl AppState {
             last_snapshot: Arc::new(RwLock::new(HashMap::new())),
             latest_cache: Arc::new(RwLock::new(HashMap::new())),
             verified_api_key_cache: Arc::new(RwLock::new(HashMap::new())),
+            raw_cache_refresh_deadlines: Arc::new(StdMutex::new(HashMap::new())),
             api_key_last_used_timestamps: Arc::new(RwLock::new(HashMap::new())),
             hypixel_last_modified: Arc::new(RwLock::new(None)),
             hypixel_last_updated: Arc::new(RwLock::new(None)),
@@ -101,6 +103,23 @@ impl AppState {
     pub async fn remove_verified_api_key_cache_prefix(&self, prefix: &str) {
         let mut entries = self.verified_api_key_cache.write().await;
         entries.retain(|_, entry| entry.value.key_prefix != prefix);
+    }
+
+    pub fn try_start_raw_cache_refresh(&self, cache_key: &str, cooldown: Duration) -> bool {
+        let now = Instant::now();
+        let mut entries = self
+            .raw_cache_refresh_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, deadline| *deadline > now);
+        if entries
+            .get(cache_key)
+            .is_some_and(|deadline| *deadline > now)
+        {
+            return false;
+        }
+        entries.insert(cache_key.to_string(), now + cooldown);
+        true
     }
 }
 
