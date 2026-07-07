@@ -16,6 +16,9 @@ const TYPED_L1_CACHE_TTL: Duration = Duration::from_secs(2);
 const RAW_L1_FRESH_TTL: Duration = Duration::from_secs(1);
 const RAW_L1_STALE_TTL: Duration = Duration::from_secs(30);
 const SMALL_RAW_L1_MAX_BYTES: usize = 64 * 1024;
+// Anonymous limits are per-IP; a small batch keeps the possible unsynced
+// allowance per instance low while still avoiding a Redis hop per request.
+const ANON_RATE_LIMIT_RESERVATION_CAP: u32 = 16;
 const LUA_RATE_LIMITER: &str = r#"
 local key = KEYS[1]
 local window = tonumber(ARGV[1])
@@ -33,8 +36,9 @@ return {current, ttl}
 const LUA_DAILY_QUOTA: &str = r#"
 local key = KEYS[1]
 local ttl = tonumber(ARGV[1])
-local current = redis.call('INCR', key)
-if current == 1 then
+local amount = tonumber(ARGV[2])
+local current = redis.call('INCRBY', key, amount)
+if current == amount then
     redis.call('EXPIRE', key, ttl)
 end
 return current
@@ -95,6 +99,7 @@ struct RateLimitReservation {
     expires_at: Instant,
     blocked: bool,
     limit: u32,
+    refill_inflight: bool,
     refill_lock: Arc<Mutex<()>>,
 }
 
@@ -106,8 +111,18 @@ impl RateLimitReservation {
             expires_at: now,
             blocked: false,
             limit,
+            refill_inflight: false,
             refill_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    fn plan_proactive_refill(&mut self, batch_size: u32) -> Option<Arc<Mutex<()>>> {
+        let threshold = (batch_size / 2).max(1);
+        if self.blocked || self.refill_inflight || self.pending < threshold {
+            return None;
+        }
+        self.refill_inflight = true;
+        Some(self.refill_lock.clone())
     }
 
     fn try_consume_local(&mut self, now: Instant, batch_size: u32) -> Option<RateLimitOutcome> {
@@ -250,9 +265,7 @@ impl SharedSecurityStore {
     }
 
     fn rate_limit_reservations(&self) -> StdMutexGuard<'_, HashMap<String, RateLimitReservation>> {
-        self.rate_limit_reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_reservations(&self.rate_limit_reservations)
     }
 
     pub async fn check_rate_limit(
@@ -262,9 +275,17 @@ impl SharedSecurityStore {
         window: Duration,
     ) -> StoreResult<RateLimitOutcome> {
         if let Some(redis) = &self.redis {
-            let result = if self.rate_limit_reservation_size > 1 && reservable_rate_key(key) {
-                self.check_rate_limit_with_local_reservation(redis, key, limit, window)
-                    .await
+            let batch_size = self.rate_reservation_batch_size(key, limit);
+            let result = if batch_size > 1 {
+                self.check_with_local_reservation(
+                    redis,
+                    ReservationKind::Rate { window },
+                    key,
+                    limit,
+                    batch_size,
+                    rate_reservation_key(key, limit, window),
+                )
+                .await
             } else {
                 redis.check_rate_limit(key, limit, window).await
             };
@@ -284,21 +305,37 @@ impl SharedSecurityStore {
         self.memory.check_rate_limit(key, limit, window).await
     }
 
-    async fn check_rate_limit_with_local_reservation(
+    fn rate_reservation_batch_size(&self, key: &str, limit: u32) -> u32 {
+        if self.rate_limit_reservation_size <= 1 || !reservable_rate_key(key) {
+            return 1;
+        }
+        let base = if key.starts_with("anonymous:") {
+            self.rate_limit_reservation_size
+                .min(ANON_RATE_LIMIT_RESERVATION_CAP)
+        } else {
+            self.rate_limit_reservation_size
+        };
+        base.min(limit.max(1)).max(1)
+    }
+
+    fn daily_quota_reservation_batch_size(&self, key: &str, limit: u32) -> u32 {
+        if self.rate_limit_reservation_size <= 1 || !reservable_rate_key(key) {
+            return 1;
+        }
+        self.rate_limit_reservation_size.min(limit.max(1)).max(1)
+    }
+
+    async fn check_with_local_reservation(
         &self,
         redis: &RedisSecurityStore,
+        kind: ReservationKind,
         key: &str,
         limit: u32,
-        window: Duration,
+        batch_size: u32,
+        reservation_key: String,
     ) -> StoreResult<RateLimitOutcome> {
         let limit = limit.max(1);
-        let batch_size = self.rate_limit_reservation_size.min(limit).max(1);
-        if batch_size == 1 {
-            return redis.check_rate_limit(key, limit, window).await;
-        }
-
         let now = Instant::now();
-        let reservation_key = rate_reservation_key(key, limit, window);
         let refill_lock = {
             let mut reservations = self.rate_limit_reservations();
             if reservations
@@ -308,42 +345,52 @@ impl SharedSecurityStore {
                 reservations.remove(&reservation_key);
             }
 
-            if let Some(entry) = reservations.get_mut(&reservation_key)
-                && let Some(outcome) = entry.try_consume_local(now, batch_size)
-            {
-                return Ok(outcome);
-            }
-
-            if !reservations.contains_key(&reservation_key)
-                && reservations.len() >= self.max_rate_keys
-            {
-                reservations.retain(|_, entry| entry.expires_at > now);
-                if !reservations.contains_key(&reservation_key)
-                    && reservations.len() >= self.max_rate_keys
-                {
-                    None
-                } else {
-                    Some(
-                        reservations
-                            .entry(reservation_key.clone())
-                            .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
-                            .refill_lock
-                            .clone(),
-                    )
+            if let Some(entry) = reservations.get_mut(&reservation_key) {
+                if let Some(outcome) = entry.try_consume_local(now, batch_size) {
+                    let refill_lock = entry.plan_proactive_refill(batch_size);
+                    drop(reservations);
+                    if let Some(refill_lock) = refill_lock {
+                        self.spawn_reservation_refill(
+                            redis.clone(),
+                            kind,
+                            key.to_string(),
+                            limit,
+                            reservation_key,
+                            refill_lock,
+                        );
+                    }
+                    return Ok(outcome);
                 }
-            } else {
-                Some(
-                    reservations
-                        .entry(reservation_key.clone())
-                        .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
-                        .refill_lock
-                        .clone(),
-                )
+                // Local credit ran out while a refill is already in flight: sync this
+                // request directly instead of convoying behind the refill lock, so a
+                // hot key degrades to pipelined per-request checks instead of stalls.
+                if entry.refill_inflight {
+                    drop(reservations);
+                    let outcome = sync_reservation(redis, kind, key, limit, 1).await?;
+                    let mut reservations = self.rate_limit_reservations();
+                    if let Some(entry) = reservations.get_mut(&reservation_key) {
+                        // Only tighten: a concurrent batch refill may already have
+                        // written a newer, lower remaining.
+                        entry.known_remaining = entry.known_remaining.min(outcome.remaining);
+                        entry.blocked = entry.blocked || !outcome.allowed;
+                        entry.expires_at = Instant::now()
+                            + Duration::from_secs(outcome.retry_after_seconds.max(1));
+                    }
+                    return Ok(outcome);
+                }
             }
-        };
 
-        let Some(refill_lock) = refill_lock else {
-            return redis.check_rate_limit(key, limit, window).await;
+            match reservation_entry(
+                &mut reservations,
+                &reservation_key,
+                now,
+                limit,
+                self.max_rate_keys,
+                |entry| entry.refill_lock.clone(),
+            ) {
+                Some(refill_lock) => refill_lock,
+                None => return sync_reservation(redis, kind, key, limit, 1).await,
+            }
         };
 
         let _refill_guard = refill_lock.lock().await;
@@ -363,41 +410,20 @@ impl SharedSecurityStore {
                 return Ok(outcome);
             }
 
-            if !reservations.contains_key(&reservation_key)
-                && reservations.len() >= self.max_rate_keys
-            {
-                reservations.retain(|_, entry| entry.expires_at > now);
-                if !reservations.contains_key(&reservation_key)
-                    && reservations.len() >= self.max_rate_keys
-                {
-                    None
-                } else {
-                    Some(
-                        reservations
-                            .entry(reservation_key.clone())
-                            .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
-                            .pending
-                            .saturating_add(1),
-                    )
-                }
-            } else {
-                Some(
-                    reservations
-                        .entry(reservation_key.clone())
-                        .or_insert_with(|| RateLimitReservation::placeholder(now, limit))
-                        .pending
-                        .saturating_add(1),
-                )
+            match reservation_entry(
+                &mut reservations,
+                &reservation_key,
+                now,
+                limit,
+                self.max_rate_keys,
+                |entry| entry.pending.saturating_add(1),
+            ) {
+                Some(amount) => amount,
+                None => return sync_reservation(redis, kind, key, limit, 1).await,
             }
         };
 
-        let Some(amount) = amount else {
-            return redis.check_rate_limit(key, limit, window).await;
-        };
-        let outcome = match redis
-            .check_rate_limit_batch(key, limit, window, amount)
-            .await
-        {
+        let outcome = match sync_reservation(redis, kind, key, limit, amount).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 let mut reservations = self.rate_limit_reservations();
@@ -416,11 +442,62 @@ impl SharedSecurityStore {
                 expires_at,
                 blocked: !outcome.allowed,
                 limit: outcome.limit,
+                refill_inflight: false,
                 refill_lock: refill_lock.clone(),
             },
         );
 
         Ok(outcome)
+    }
+
+    fn spawn_reservation_refill(
+        &self,
+        redis: RedisSecurityStore,
+        kind: ReservationKind,
+        key: String,
+        limit: u32,
+        reservation_key: String,
+        refill_lock: Arc<Mutex<()>>,
+    ) {
+        let reservations = Arc::clone(&self.rate_limit_reservations);
+        tokio::spawn(async move {
+            let _refill_guard = refill_lock.lock().await;
+            let pending = {
+                let mut reservations = lock_reservations(&reservations);
+                let Some(entry) = reservations.get_mut(&reservation_key) else {
+                    return;
+                };
+                if entry.pending == 0 {
+                    entry.refill_inflight = false;
+                    return;
+                }
+                entry.pending
+            };
+
+            match sync_reservation(&redis, kind, &key, limit, pending).await {
+                Ok(outcome) => {
+                    let mut reservations = lock_reservations(&reservations);
+                    if let Some(entry) = reservations.get_mut(&reservation_key) {
+                        entry.pending = entry.pending.saturating_sub(pending);
+                        // Within one window remaining only shrinks, so only tighten:
+                        // a direct sync racing this refill may have written a newer,
+                        // lower value. Window rollover recreates the entry instead.
+                        entry.known_remaining = entry.known_remaining.min(outcome.remaining);
+                        entry.expires_at = Instant::now()
+                            + Duration::from_secs(outcome.retry_after_seconds.max(1));
+                        entry.blocked = entry.blocked || !outcome.allowed;
+                        entry.refill_inflight = false;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Background reservation refill failed: {}", error);
+                    let mut reservations = lock_reservations(&reservations);
+                    if let Some(entry) = reservations.get_mut(&reservation_key) {
+                        entry.refill_inflight = false;
+                    }
+                }
+            }
+        });
     }
 
     pub async fn check_daily_quota(
@@ -430,7 +507,27 @@ impl SharedSecurityStore {
         now: DateTime<Utc>,
     ) -> StoreResult<DailyQuotaOutcome> {
         if let Some(redis) = &self.redis {
-            match redis.check_daily_quota(key, limit, now).await {
+            let batch_size = self.daily_quota_reservation_batch_size(key, limit);
+            let result = if batch_size > 1 {
+                self.check_with_local_reservation(
+                    redis,
+                    ReservationKind::DailyQuota,
+                    key,
+                    limit,
+                    batch_size,
+                    daily_quota_reservation_key(key, limit, now),
+                )
+                .await
+                .map(|outcome| DailyQuotaOutcome {
+                    allowed: outcome.allowed,
+                    limit: outcome.limit,
+                    remaining: outcome.remaining,
+                    reset_at: next_utc_midnight(now),
+                })
+            } else {
+                redis.check_daily_quota(key, limit, now).await
+            };
+            match result {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) if self.redis_required => return Err(error),
                 Err(error) => eprintln!(
@@ -802,12 +899,23 @@ impl RedisSecurityStore {
         limit: u32,
         now: DateTime<Utc>,
     ) -> StoreResult<DailyQuotaOutcome> {
+        self.check_daily_quota_batch(key, limit, now, 1).await
+    }
+
+    async fn check_daily_quota_batch(
+        &self,
+        key: &str,
+        limit: u32,
+        now: DateTime<Utc>,
+        amount: u32,
+    ) -> StoreResult<DailyQuotaOutcome> {
         let reset_at = next_utc_midnight(now);
         let key = redis_key(&format!("quota:{}:{}", key, now.format("%Y%m%d")));
         let mut conn = self.manager.clone();
         let count = redis::Script::new(LUA_DAILY_QUOTA)
             .key(&key)
             .arg(seconds_until(reset_at, now))
+            .arg(amount.max(1))
             .invoke_async::<u32>(&mut conn)
             .await
             .map_err(|error| SecurityStoreError::new(error.to_string()))?;
@@ -1400,12 +1508,74 @@ fn redis_key(suffix: &str) -> String {
     format!("{}{}", REDIS_KEY_PREFIX, suffix)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ReservationKind {
+    Rate { window: Duration },
+    DailyQuota,
+}
+
+async fn sync_reservation(
+    redis: &RedisSecurityStore,
+    kind: ReservationKind,
+    key: &str,
+    limit: u32,
+    amount: u32,
+) -> StoreResult<RateLimitOutcome> {
+    match kind {
+        ReservationKind::Rate { window } => {
+            redis.check_rate_limit_batch(key, limit, window, amount).await
+        }
+        ReservationKind::DailyQuota => {
+            let now = Utc::now();
+            let outcome = redis.check_daily_quota_batch(key, limit, now, amount).await?;
+            Ok(RateLimitOutcome {
+                allowed: outcome.allowed,
+                limit: outcome.limit,
+                remaining: outcome.remaining,
+                retry_after_seconds: seconds_until(outcome.reset_at, now),
+            })
+        }
+    }
+}
+
+fn reservation_entry<T>(
+    reservations: &mut HashMap<String, RateLimitReservation>,
+    reservation_key: &str,
+    now: Instant,
+    limit: u32,
+    max_rate_keys: usize,
+    access: impl FnOnce(&mut RateLimitReservation) -> T,
+) -> Option<T> {
+    if !reservations.contains_key(reservation_key) && reservations.len() >= max_rate_keys {
+        reservations.retain(|_, entry| entry.expires_at > now);
+        if !reservations.contains_key(reservation_key) && reservations.len() >= max_rate_keys {
+            return None;
+        }
+    }
+    let entry = reservations
+        .entry(reservation_key.to_string())
+        .or_insert_with(|| RateLimitReservation::placeholder(now, limit));
+    Some(access(entry))
+}
+
+fn lock_reservations(
+    reservations: &StdMutex<HashMap<String, RateLimitReservation>>,
+) -> StdMutexGuard<'_, HashMap<String, RateLimitReservation>> {
+    reservations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn reservable_rate_key(key: &str) -> bool {
-    key.starts_with("api-key:")
+    key.starts_with("api-key:") || key.starts_with("anonymous:")
 }
 
 fn rate_reservation_key(key: &str, limit: u32, window: Duration) -> String {
     format!("{}:{}:{}", key, limit.max(1), window.as_secs().max(1))
+}
+
+fn daily_quota_reservation_key(key: &str, limit: u32, now: DateTime<Utc>) -> String {
+    format!("quota:{}:{}:{}", key, limit.max(1), now.format("%Y%m%d"))
 }
 
 fn rate_outcome(count: u32, limit: u32, retry_after_seconds: u64) -> RateLimitOutcome {
@@ -1603,6 +1773,7 @@ mod tests {
     fn redis_lua_scripts_keep_rate_limit_operations_atomic() {
         assert!(LUA_RATE_LIMITER.contains("INCRBY"));
         assert!(LUA_RATE_LIMITER.contains("TTL"));
+        assert!(LUA_DAILY_QUOTA.contains("INCRBY"));
         assert!(LUA_DAILY_QUOTA.contains("EXPIRE"));
     }
 
@@ -1615,6 +1786,7 @@ mod tests {
             expires_at: now + Duration::from_secs(60),
             blocked: false,
             limit: 1000,
+            refill_inflight: false,
             refill_lock: Arc::new(Mutex::new(())),
         };
 
@@ -1628,9 +1800,51 @@ mod tests {
     }
 
     #[test]
-    fn only_user_api_key_limits_use_local_reservation() {
+    fn proactive_refill_triggers_once_past_threshold() {
+        let now = std::time::Instant::now();
+        let mut reservation = super::RateLimitReservation {
+            pending: 0,
+            known_remaining: 1000,
+            expires_at: now + Duration::from_secs(60),
+            blocked: false,
+            limit: 1000,
+            refill_inflight: false,
+            refill_lock: Arc::new(Mutex::new(())),
+        };
+
+        assert!(reservation.plan_proactive_refill(128).is_none());
+        reservation.pending = 64;
+        assert!(reservation.plan_proactive_refill(128).is_some());
+        assert!(reservation.refill_inflight);
+        assert!(reservation.plan_proactive_refill(128).is_none());
+    }
+
+    #[test]
+    fn api_key_and_anonymous_limits_use_local_reservation() {
         assert!(super::reservable_rate_key("api-key:abc"));
-        assert!(!super::reservable_rate_key("anonymous:127.0.0.1"));
+        assert!(super::reservable_rate_key("anonymous:127.0.0.1"));
         assert!(!super::reservable_rate_key("admin-login-minute:127.0.0.1"));
+        assert!(!super::reservable_rate_key("admin-api-key-attempt:127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn reservation_batch_sizes_respect_key_type_and_limit() {
+        let store = SharedSecurityStore::new(&test_config()).await;
+
+        assert_eq!(store.rate_reservation_batch_size("api-key:abc", 1_000_000), 128);
+        assert_eq!(
+            store.rate_reservation_batch_size("anonymous:127.0.0.1", 1_000_000),
+            16
+        );
+        assert_eq!(store.rate_reservation_batch_size("anonymous:127.0.0.1", 8), 8);
+        assert_eq!(store.rate_reservation_batch_size("admin-session:x", 120), 1);
+        assert_eq!(
+            store.daily_quota_reservation_batch_size("api-key:abc", 50),
+            50
+        );
+        assert_eq!(
+            store.daily_quota_reservation_batch_size("api-key:abc", 1_000_000),
+            128
+        );
     }
 }
